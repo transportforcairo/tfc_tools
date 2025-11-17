@@ -27,6 +27,10 @@ __date__ = '2025-08-28'
 __copyright__ = '(C) 2025 by Transport for Cairo'
 
 
+from .tfc_tools_common import ensure_bootstrap
+ensure_bootstrap()
+
+
 # noinspection PyPep8Naming
 def classFactory(iface):  # pylint: disable=invalid-name
     """Load TfCTools class from file TfCTools.

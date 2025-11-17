@@ -39,7 +39,7 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
-                       QgsProcessingParameterFile, #newly added
+                       QgsProcessingParameterFile,
                        QgsProcessingParameterProviderConnection,
                        QgsProcessingParameterString,
                        QgsProcessingParameterFolderDestination)
@@ -135,8 +135,7 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
         connection = connect_postgis(connection_name, feedback=feedback)
 
         estimator = FlowEstimator(gtfs_path, connection, output_folder)
-        # estimator.run()
-        estimator.run(feedback=feedback)  # we added feedback=feedback here and feedback above to know if connection ran successfully in full_script.py run()
+        estimator.run(feedback=feedback)
 
         return {'OUTPUT': output_folder}
 
@@ -162,7 +161,6 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
         Returns the name of the group this algorithm belongs to. This string
         should be localised.
         """
-        # return self.tr(self.groupId())
         return self.tr('02 GIS Tools')
 
     def groupId(self):
@@ -176,7 +174,30 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
         return 'gis_tools'
     
     def shortHelpString(self):
-        return self.tr("This algorithm creates estimate vehicle and passenger flows from spatial database layers and GTFS data.")  # later revise this text here
+        return self.tr("""
+            <b>Purpose of the Plugin</b>
+            The Vehicle and Passenger Flow Plugin estimates vehicle and passenger flows along road segments based on GTFS data.
+            It uses GTFS trips and OSM road geometry to calculate flows per time interval as configured in the PostGIS table
+            <code>transit.intervals</code> (for example, morning and afternoon peaks). Only rows marked as <code>active = TRUE</code>
+            are used when classifying flows.<br>
+
+            <b>How to Use the Plugin</b>
+            1. Select the GTFS <code>.zip</code> file (from GIS2GTFS or any valid GTFS feed).
+            2. Choose the PostGIS SDI connection (standard schema from RL2SDI).
+            3. Ensure that <code>transit.intervals</code> is populated with the desired time bands
+            (columns <code>start_time</code>, <code>end_time</code>, <code>name</code>, <code>active</code>).
+            4. Specify an output folder for results.
+            5. Run the plugin to generate flow GeoPackages and diagnostic files.<br>
+
+            <b>Outputs</b>
+            • <code>vehicle_flow.gpkg</code>: vehicle flows, one layer per active interval from <code>transit.intervals</code>.
+            • <code>passenger_flow.gpkg</code>: passenger flows, one layer per active interval from <code>transit.intervals</code>.
+
+            <b>More Information</b>
+            Detailed explanation of workflow, schema, and Fréchet distance matching is available in the User Guide:
+            <a href="https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf">TfC Tools User Guide</a>
+            """)
+
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

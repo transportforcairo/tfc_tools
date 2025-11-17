@@ -100,16 +100,44 @@ def gdf_to_qgis_layer(gdf, layer_name):
     
     # Add fields
     pr = vl.dataProvider()
-    pr.addAttributes([QgsField(str(col), QVariant.String) for col in gdf.columns if col != gdf.geometry.name])
+
+    # --- FIELD DEFINITIONS: infer type from pandas dtypes ---
+    fields = []
+    for col in gdf.columns:
+        if col == gdf.geometry.name:
+            continue
+        dtype = gdf[col].dtype
+
+        if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
+            qtype = QVariant.Int
+        elif np.issubdtype(dtype, np.floating):
+            qtype = QVariant.Double
+        else:
+            qtype = QVariant.String
+
+        fields.append(QgsField(str(col), qtype))
+    pr.addAttributes(fields)
+
     vl.updateFields()
-    
-    # Add features
+
+    # --- FEATURES / ATTRIBUTES: keep native types (no str() cast) ---
     for _, row in gdf.iterrows():
         feat = QgsFeature()
         feat.setGeometry(QgsGeometry.fromWkt(row.geometry.wkt))
-        attrs = [str(row[col]) for col in gdf.columns if col != gdf.geometry.name]
+
+        attrs = []
+        for col in gdf.columns:
+            if col == gdf.geometry.name:
+                continue
+            val = row[col]
+            # Let QGIS handle None as NULL
+            if pd.isna(val):
+                attrs.append(None)
+            else:
+                attrs.append(val)
+
         feat.setAttributes(attrs)
-        pr.addFeature(feat)
+        pr.addFeature(feat)    
     
     vl.updateExtents()
     return vl
@@ -253,29 +281,6 @@ def extract_osm_roads(self, map_boundary, feedback=None):
     if feedback:
         feedback.pushInfo("Bounding box for OSM query calculated.")
 
-    # --- THIS SECTION IS FOR DEBUGGING BY EXPORTING THE BOUNDING BOX IN 4326
-    # if self.output_folder and isinstance(self.output_folder, str):
-    #     try:
-    #         debug_path = os.path.join(self.output_folder, "debug_boundary.geojson")
-    #         # Write a minimal GeoJSON FeatureCollection
-    #         with open(debug_path, "w", encoding="utf-8") as f:
-    #             geojson_dict = {
-    #                 "type": "FeatureCollection",
-    #                 "features": [
-    #                     {
-    #                         "type": "Feature",
-    #                         "geometry": mapping(map_boundary.geometry.iloc[0]),
-    #                         "properties": {},
-    #                     }
-    #                 ],
-    #             }
-    #             json.dump(geojson_dict, f)
-    #         if feedback:
-    #             feedback.pushInfo(f"Saved debug boundary to {debug_path}")
-    #     except Exception as e:
-    #         if feedback:
-    #             feedback.pushInfo(f"Failed to export debug boundary: {e}")
-
 
     # Construct Overpass API query
     overpass_url = "http://overpass-api.de/api/interpreter"
@@ -365,12 +370,7 @@ class FlowEstimator:
             "segment_matching_buffer_meters": 10,
             "frechet_dist_densify_param": 0.1,
             "frechet_dist_segment_length_ratio_max_thresh": 0.5, #revise this part
-        }
-
-        self.interval_boundaries = [
-            ("06:00:00", "10:00:00"), #revise timezones later
-            ("10:05:00", "15:45:00")
-        ]        
+        }   
 
     def download_required_layers(self, feedback=None):
         if feedback:
@@ -472,31 +472,36 @@ class FlowEstimator:
             )
         )
 
-        logger.info("Generating time intervals")
-        intervals_df = (
-            pd.DataFrame(
-                self.interval_boundaries,
-                columns=["start", "end"],
-            )
-            .assign(
-                interval_start_secs=lambda df: (
-                    df.start.astype("datetime64[ns]")
-                    - df.start.astype("datetime64[ns]").dt.floor("d")
-                ).dt.total_seconds()
-            )
-            .assign(
-                interval_end_secs=lambda df: (
-                    df.end.astype("datetime64[ns]")
-                    - df.end.astype("datetime64[ns]").dt.floor("d")
-                ).dt.total_seconds()
-            )
-            .assign(
-                interval_name=[
-                    "morning_peak",
-                    "afternoon"
-                ]
-            )
+        logger.info("Generating time intervals from transit.intervals")
+        intervals_raw = pd.read_sql(
+            """
+            SELECT
+                start_time,
+                end_time,
+                name AS interval_name,
+                active
+            FROM transit.intervals
+            WHERE active = TRUE
+            ORDER BY start_time
+            """,
+            con=self.connection,
         )
+
+        if intervals_raw.empty:
+            raise ValueError(
+                "No active intervals found in transit.intervals. "
+                "Please populate transit.intervals and mark at least one row as active."
+            )
+
+        # Convert start/end times (e.g. '06:00:00') to seconds from midnight
+        intervals_df = (
+            intervals_raw
+            .assign(
+                interval_start_secs=lambda df: pd.to_timedelta(df["start_time"].astype(str)).dt.total_seconds(),
+                interval_end_secs=lambda df: pd.to_timedelta(df["end_time"].astype(str)).dt.total_seconds(),
+            )[["interval_name", "interval_start_secs", "interval_end_secs"]]
+        )
+
 
         logger.info("Classifying vehicle occurrences into intervals")
         # Remove geometry for compatibility
@@ -739,43 +744,45 @@ class FlowEstimator:
             .fillna(0)
         )
 
-        veh_gpkg = os.path.join(self.output_folder, "veh_flow.gpkg")
-        save_gdf_with_qgis_writer(
-            veh_flow.query("interval_name == 'morning_peak'").set_crs(3857, inplace=False),
-            veh_gpkg, 
-            "morning_peak", 
-            feedback
-            )
-        save_gdf_with_qgis_writer(
-            veh_flow.query("interval_name == 'afternoon'").set_crs(3857, inplace=False),  
-            veh_gpkg, 
-            "afternoon",   
-            feedback
+        veh_gpkg = os.path.join(self.output_folder, "vehicle_flow.gpkg")
+
+        # Write one layer per active interval from transit.intervals
+        for interval_name in sorted(intervals_df["interval_name"].unique()):
+            interval_layer = veh_flow.query("interval_name == @interval_name")
+            if interval_layer.empty:
+                continue
+            save_gdf_with_qgis_writer(
+                interval_layer.set_crs(3857, inplace=False),
+                veh_gpkg,
+                interval_name,
+                feedback,
             )
 
         pass_gpkg = os.path.join(self.output_folder, "passenger_flow.gpkg")
-        save_gdf_with_qgis_writer(
-            passenger_flow.query("interval_name == 'morning_peak'").set_crs(3857, inplace=False),
-            pass_gpkg, 
-            "morning_peak", 
-            feedback
-            )
-        save_gdf_with_qgis_writer(
-            passenger_flow.query("interval_name == 'afternoon'").set_crs(3857, inplace=False),   
-            pass_gpkg, 
-            "afternoon",   
-            feedback
+        for interval_name in sorted(intervals_df["interval_name"].unique()):
+            interval_layer = passenger_flow.query("interval_name == @interval_name")
+            if interval_layer.empty:
+                continue
+            save_gdf_with_qgis_writer(
+                interval_layer.set_crs(3857, inplace=False),
+                pass_gpkg,
+                interval_name,
+                feedback,
             )
 
 
-        for name, df in [
-            ("veh_flow total", veh_flow),
-            ("veh morning", veh_flow.query("interval_name == 'morning_peak'")),
-            ("veh afternoon", veh_flow.query("interval_name == 'afternoon'")),
-        ]:
+
+        debug_groups = [("veh_flow total", veh_flow)]
+        for interval_name in sorted(intervals_df["interval_name"].unique()):
+            debug_groups.append(
+                (f"veh {interval_name}", veh_flow.query("interval_name == @interval_name"))
+            )
+
+        for name, df in debug_groups:
             if feedback:
                 geom_ok = 0 if df.empty else (~df.geometry.is_empty).sum()
                 feedback.pushInfo(f"[DEBUG] {name}: rows={len(df)}, non-empty geoms={geom_ok}, crs={df.crs}")
+
 
 
         # logger.success("Vehicle and passenger flow estimation complete.") # WE REPLACED logger.success() WITH THE NEXT LINE

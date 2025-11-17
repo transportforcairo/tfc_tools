@@ -90,7 +90,7 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterProviderConnection(
                 self.CONN_NAME,
-                self.tr('PostgreSQL SDI Connection'),  # in rl2sdi plugin format it would've just been "PostgreSQL SDI Connection"
+                self.tr('PostgreSQL SDI Connection'), 
                 provider='postgres'
             )
         )
@@ -172,12 +172,12 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
             feed_start_date=start_date,
             feed_end_date=end_date,
             feed_version=1,
-            feed_lang="en",  #maybe later we can let the user choose the feed_lang
+            feed_lang="en",
             start_date=start_date,
             end_date=end_date,
             service_id=service_id,
             continuous_dropoff_pickup=continuous,
-            dwell_time_sec=15   #check if we want to let the user choose the value
+            dwell_time_sec=15
         )
 
         return {}
@@ -204,7 +204,6 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
         Returns the name of the group this algorithm belongs to. This string
         should be localised.
         """
-        # return self.tr(self.groupId())
         return self.tr('02 GIS Tools')
 
     def groupId(self):
@@ -215,11 +214,36 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
         contain lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        # return 'GIS tools'
         return 'gis_tools'
     
     def shortHelpString(self):
-        return self.tr("This algorithm build a GTFS feed from spatial database layers.")  # later revise this text here
+        return self.tr("""
+    <b>Purpose of the Plugin</b>
+    The GIS2GTFS Plugin automates the creation of a General Transit Feed Specification (GTFS) dataset from existing transport data stored in a PostgreSQL SDI. 
+    It relies on TfC’s standardized schema (the same one produced by the RL2SDI plugin) to ensure consistency and interoperability.<br>
+
+    <b>How to Use the Plugin</b>
+    1. Choose your PostgreSQL SDI connection (from RL2SDI output or a database following the same schema).
+    2. Enter feed details:
+    &nbsp;&nbsp;&nbsp;&nbsp;• Feed version (e.g. 1.0)
+    &nbsp;&nbsp;&nbsp;&nbsp;• Start date (e.g. 20250101)
+    &nbsp;&nbsp;&nbsp;&nbsp;• End date (e.g. 20251231)
+    &nbsp;&nbsp;&nbsp;&nbsp;• Service ID (e.g. Ground_Daily)
+    3. Keep “Use continuous drop-off/pick-up” checked unless you need to disable it.
+    4. Select two output folders:
+    &nbsp;&nbsp;&nbsp;&nbsp;• Folder 1 – temporary raw files (internal use, can be deleted later).
+    &nbsp;&nbsp;&nbsp;&nbsp;• Folder 2 – final GTFS <code>.txt</code> files.
+    5. Run the plugin to generate the GTFS feed.<br>
+
+    <b>Outputs</b>
+    • Folder 1: raw intermediate files (not required afterwards).
+    • Folder 2: GTFS dataset (9 text files forming a valid feed).<br>
+
+    <b>More Information</b>
+    For schema requirements and validation guidance, see the User Guide:
+    <a href="https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf">TfC Tools User Guide</a>
+    """)
+
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

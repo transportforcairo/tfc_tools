@@ -4,31 +4,35 @@
 
 [general]
 name=TfC Tools
-qgisMinimumVersion=3.0
-description=A suite of Transport for Cairo tools: RouteLab to SDI migration, GIS2GTFS, and Vehicle & Passenger Flow.
-version=1.0
+qgisMinimumVersion=3.40
+description=A suite of tools by Transport for Cairo: RouteLab to SDI migration, GIS2GTFS, and Vehicle & Passenger Flow.
+version=1.1
 author=Transport for Cairo
 email=info@transportforcairo.com
 
-about=This plugin is part of Transport for Cairo (TfC) Toolkit. It currently has 3 main plugins: 
-    1. RL2SDI: RouteLab to SDI Migration Plugin 
-    2. GIS2GTFS: GIS to GTFS Plugin 
-    3. Vehicle and Passenger Flow: a plugin for estimating vehicle flows and passenger flows on road segments using GTFS
+about=TfC Tools is a Processing provider with 3 algorithms developed by Transport for Cairo (TfC): 
+    1. RL2SDI — migrates RouteLab survey data into a standardized PostGIS SDI.
+    2. GIS2GTFS — builds a GTFS feed from a standardized SDI 
+    3. Vehicle and Passenger Flow — estimates vehicle flows and passenger flows per road segment from a GTFS feed.
+User Guide (PDF): https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf
 
-tracker=https://github.com/transportforcairo/tfc_tools/issues
+
+# Links
+homepage=https://transportforcairo.com
 repository=https://github.com/transportforcairo/tfc_tools
+tracker=https://github.com/transportforcairo/tfc_tools/issues
 # End of mandatory metadata
 
 # Recommended items:
-
 hasProcessingProvider=yes
-# Uncomment the following line and add your changelog:
-# changelog=
+changelog=Version 1.1:
+    • Dynamic time intervals pulled directly from the database instead of static “morning” and “afternoon” intervals.
+    • Lighter plugin version with fewer required libraries.
+    • Help panel updated with clearer explanations and a link to the User Guide PDF.
 
 # Tags are comma separated with spaces allowed
-tags=python
+tags=transport,transit,gtfs,postgis,gis,qgis,flows,geopandas,sdx,sdI,python
 
-homepage=https://transportforcairo.com
 category=Analysis
 icon=icons/TfC-tools-icon.png
 # experimental flag

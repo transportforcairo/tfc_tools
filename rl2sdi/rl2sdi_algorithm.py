@@ -36,11 +36,11 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
-                       QgsProcessingParameterString,  #newly added from this line
+                       QgsProcessingParameterString,
                        QgsProcessingParameterProviderConnection,
                        QgsApplication,
                        QgsProviderRegistry,
-                       QgsDataSourceUri) #this is for conn_mgr
+                       QgsDataSourceUri)
 from .script4plugin import run_migration
 import urllib.parse 
 
@@ -75,9 +75,6 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
     OBSERVER_CONN = 'observer_connection'
     SDI_CONN = 'sdi_connection'
     PROJECT_ID = 'project_id'
-
-    # OUTPUT = 'OUTPUT'
-    # INPUT = 'INPUT'
 
     def initAlgorithm(self, config=None):
         """
@@ -141,8 +138,8 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
         sdi_uri_str = sdi_conn.uri()
 
         # Parse URI string into connection details
-        observer_uri = QgsDataSourceUri(observer_uri_str) #ChatGPT suggested the naming observer_uri
-        sdi_uri = QgsDataSourceUri(sdi_uri_str)  #ChatGPT suggested the naming sdi_uri
+        observer_uri = QgsDataSourceUri(observer_uri_str)
+        sdi_uri = QgsDataSourceUri(sdi_uri_str)
 
         observer_db_params = {
             "dbname": observer_uri.database(),
@@ -159,17 +156,6 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
             "host": sdi_uri.host(),
             "port": str(sdi_uri.port())
         }
-        
-
-        # You can now pass observer_db_params and sdi_db_params to your migration logic
-        # run_migration(observer_db_params, sdi_db_params, project_id, feedback)
-
-        # Return the results of the algorithm. In this case our only result is
-        # the feature sink which contains the processed features, but some
-        # algorithms may return multiple feature sinks, calculated numeric
-        # statistics, etc. These should all be included in the returned
-        # dictionary, with keys matching the feature corresponding parameter
-        # or output names.
 
         # Call the core logic function run_migration(), with the cleaned-up inputs
         run_migration(observer_db_params, sdi_db_params, project_id, feedback)
@@ -198,7 +184,6 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
         Returns the name of the group this algorithm belongs to. This string
         should be localised.
         """
-        # return self.tr(self.groupId())
         return self.tr('01 RouteLab Tools')
 
     def groupId(self):
@@ -209,11 +194,29 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
         contain lowercase alphanumeric characters only and no spaces or other
         formatting characters.
         """
-        # return 'Migration tools'
         return 'rl_tools'
     
     def shortHelpString(self):
-        return self.tr("This algorithm migrates field surveys data from Transport for Cairo TfC's RouteLab database to an SDI.")  # later revise this text here    
+        return self.tr("""
+    <b>Purpose of the Plugin</b>
+    The RL2SDI Migration Plugin automates the migration of field survey data from Transport for Cairo’s (TfC) RouteLab database into a Spatial Data Infrastructure (SDI). 
+    It creates standardized <code>raw</code> and <code>transit</code> schemas in a PostGIS database, enabling further analysis or use with the other TfC Tools plugins (GIS2GTFS and Vehicle and Passenger Flow).<br>
+
+    <b>How to Use the Plugin</b>
+    1. Select the RouteLab database connection (credentials provided by TfC).
+    2. Select the PostGIS SDI connection where the data will be migrated.
+    3. Enter the Project ID — the unique identifier for your RouteLab project.
+    4. Run the plugin to automatically generate and populate the <code>raw</code> and <code>transit</code> schemas.<br>
+
+    <b>Outputs</b>
+    • <code>raw</code> schema: cleaned RouteLab data.
+    • <code>transit</code> schema: processed, analysis-ready datasets.<br>
+
+    <b>More Information</b>
+    Full details and screenshots are available in the User Guide:
+    <a href="https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf">TfC Tools User Guide</a>
+    """)
+
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)

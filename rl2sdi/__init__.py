@@ -26,14 +26,9 @@ __author__ = 'Transport for Cairo'
 __date__ = '2025-06-29'
 __copyright__ = '(C) 2025 by Transport for Cairo'
 
-# this part is for importing sqlalchemy
-import sys
-import os
- 
-plugin_dir = os.path.dirname(__file__)
-lib_path = os.path.join(plugin_dir, 'libs')
-if lib_path not in sys.path:
-    sys.path.insert(0, lib_path)
+# Unified deps handled at plugin root
+from ..tfc_tools_common import ensure_bootstrap
+ensure_bootstrap()
  
 
 # noinspection PyPep8Naming

@@ -52,6 +52,8 @@ Creates two new schemas in the target database:
 - `raw` — cleaned field data from RouteLab  
 - `transit` — processed, structured results
 
+A complete list of output tables and fields for both schemas is included in the User Guide.
+
 **Next Steps:**  
 Output can be analyzed directly in QGIS or used as input to the *GIS2GTFS* or *Vehicle and Passenger Flow* plugins.
 
@@ -63,7 +65,7 @@ Output can be analyzed directly in QGIS or used as input to the *GIS2GTFS* or *V
 Generates a GTFS feed from a standardized SDI in PostGIS.
 
 **Inputs:**
-- SDI connection (from *RL2SDI*).  
+- SDI connection (standard schema from *RL2SDI* or following the schema described in the User Guide). 
 - Feed version, start and end dates, service ID.  
 - Option to enable/disable continuous drop-off/pick-up.  
 - Two output folders:  
@@ -88,7 +90,7 @@ Estimates vehicle and passenger flows per road segment based on GTFS data.
 
 **Inputs:**
 - GTFS `.zip` file (e.g. output from *GIS2GTFS*).  
-- PostGIS connection (standard schema from *RL2SDI*).  
+- PostGIS connection (standard schema from *RL2SDI* or following the schema described in the User Guide).  
 - Output folder for generated files.
 
 **Process Summary:**
@@ -99,15 +101,12 @@ Estimates vehicle and passenger flows per road segment based on GTFS data.
 5. Outputs the results for visualization in QGIS.
 
 **Outputs:**
-- `veh_flow.gpkg` — Vehicle flow (morning and afternoon peaks)  
+- `vehicle_flow.gpkg` — Vehicle flow (morning and afternoon peaks)  
 - `passenger_flow.gpkg` — Passenger flow (morning and afternoon peaks)  
-- `debug_boundary.geojson` — boundary visualization layer
 
-**Output Fields:**
+**Main Output Fields:**
 | Field | Description |
 |--------|-------------|
-| `fid` | Auto-generated unique ID |
-| `gid` | Road segment ID from OSM |
 | `interval_name` | Time interval name |
 | `value` | Estimated passengers or vehicles per segment per hour |
 
@@ -116,14 +115,16 @@ Estimates vehicle and passenger flows per road segment based on GTFS data.
 ## Technical Notes
 
 - The plugins rely on PostGIS connections configured in QGIS.  
-- Compatible with **QGIS 3.0 and later** (tested on 3.34).  
+- Compatible with **QGIS 3.40+**.
 - Designed for reproducible workflows using TfC’s standard SDI schema.  
 
 ---
 
 ## Documentation
 
-A detailed **User Guide** (with screenshots and schema tables) will be added to this repository soon.
+Full details, figures, and database schema descriptions are available in the **User Guide (PDF)**:  
+[**tfc_tools_user_guide.pdf**](https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf)
+
 
 ---
 
@@ -131,6 +132,12 @@ A detailed **User Guide** (with screenshots and schema tables) will be added to 
 
 TfC Tools is released under the **GNU General Public License v2 (GPL-2.0)**.  
 See the [LICENSE](./LICENSE) file for details.
+
+---
+
+## Version
+
+**Current version:** 1.1  |  **Release date:** November 2025
 
 ---
 

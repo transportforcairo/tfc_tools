@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from .tfc_tools_common import ensure_bootstrap
+ensure_bootstrap()
 
 """
 /***************************************************************************
