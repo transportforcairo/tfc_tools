@@ -10,14 +10,30 @@ It provides tools commonly used in TfC’s research and transport data managemen
 TfC Tools includes three Processing Toolbox plugins that can be used independently or as part of a workflow:
 
 **Workflow:**  
-`RouteLab → RL2SDI → GIS2GTFS → Vehicle and Passenger Flow`
+`RouteLab → RL2SDI / RL2GPKG / SDI2GPKG → GeoPackage / SDI → GIS2GTFS / Revenue Estimator / Vehicle & Passenger Flow`
 
-| Plugin | Purpose |
-|---------|----------|
-| **RL2SDI (RouteLab to SDI Migration)** | Migrates RouteLab field survey data into a standardized PostGIS Spatial Data Infrastructure (SDI). |
-| **GIS2GTFS** | Converts a PostGIS SDI (in TfC’s standard schema) into a valid GTFS feed. |
-| **Vehicle and Passenger Flow** | Estimates vehicle and passenger flows on road segments based on GTFS data. |
+## Plugin Structure
 
+TfC Tools v2.0 introduces two tool groups:
+
+### 1. RouteLab Tools
+Tools that migrate field survey data from TfC’s RouteLab database into standardized tables, either in GeoPackage format or in a PostgreSQL/PostGIS Spatial Data Infrastructure (SDI).
+
+| Tool | Purpose |
+|-----|-----|
+| Export RouteLab to GeoPackage | Exports RouteLab survey data into a portable GeoPackage format for analysis without requiring a database. |
+| Export SDI (PostGIS) to GeoPackage | Exports an existing SDI database to a GeoPackage format. |
+| RL2SDI (RouteLab to SDI Migration) | Migrates RouteLab survey data into a standardized PostGIS SDI schema. |
+
+### 2. GIS Tools
+Tools for transport network analysis, GTFS generation, and transport metrics.
+
+| Tool | Purpose |
+|-----|-----|
+| GIS2GTFS | Converts GIS data in a standards schema, either from a PostGIS SDI or a Geopackage file, into a valid GTFS feed. |
+| Refresh SDI derived layers | Rebuilds derived tables and materialized views in an SDI or GeoPackage. |
+| Trip and Route Revenue Estimator | Estimates potential revenue for routes and trips based on ridership and fare inputs. |
+| Vehicle and Passenger Flow Estimator | Estimates vehicle flows and passenger flows on road segments using standardized SDI or GeoPackage data. |
 ---
 
 ## Installation
@@ -46,6 +62,7 @@ Migrates field survey data from TfC’s RouteLab database into a standardized SD
 - RouteLab database connection (credentials provided by TfC).  
 - PostGIS SDI connection for data migration.  
 - Project ID (unique identifier per RouteLab project).
+- Headways (optional, for trips with missing headway data).
 
 **Output:**  
 Creates two new schemas in the target database:
@@ -59,13 +76,55 @@ Output can be analyzed directly in QGIS or used as input to the *GIS2GTFS* or *V
 
 ---
 
-## 2. GIS2GTFS Plugin
+## 2. Export RouteLab to GeoPackage
 
 **Purpose:**  
-Generates a GTFS feed from a standardized SDI in PostGIS.
+Exports RouteLab field survey data into a GeoPackage file following TfC’s standardized schema.  
+This allows working with the data without requiring a PostgreSQL database.
 
 **Inputs:**
-- SDI connection (standard schema from *RL2SDI* or following the schema described in the User Guide). 
+- RouteLab database connection (credentials provided by TfC).  
+- Project ID (unique identifier per RouteLab project).  
+- Headways (optional, for trips with missing headway data).
+- Output folder.
+
+**Outputs:**
+- A GeoPackage file containing standardized datasets equivalent to the `raw` and `transit` structures.
+
+**Use Cases:**
+- Offline analysis without database access  
+- Data sharing across teams  
+- Input to other TfC Tools (GIS2GTFS, Flow, Revenue)
+
+---
+
+## 3. Export SDI (PostGIS) to GeoPackage
+
+**Purpose:**  
+Exports an existing PostgreSQL/PostGIS SDI database into a GeoPackage format.
+
+**Inputs:**
+- PostgreSQL SDI connection (standard schema).  
+- Headways (optional, for trips with missing headway data).
+- Output folder.
+
+**Outputs:**
+- A GeoPackage replicating the SDI schema and datasets.
+
+**Use Cases:**
+- Sharing SDI datasets without database access  
+- Creating portable project files  
+- Backup and archiving
+
+---
+
+## 4. GIS2GTFS Plugin
+
+**Purpose:**  
+Generates a GTFS feed from a standardized dataset stored in either a PostGIS SDI or a GeoPackage.
+
+**Inputs:**
+- SDI connection or GeoPackage (standard schema from *RL2SDI* or *RL2GPKG* or following the schema described in the User Guide). 
 - Feed version, start and end dates, service ID.  
 - Option to enable/disable continuous drop-off/pick-up.  
 - Two output folders:  
@@ -83,32 +142,62 @@ Validate using [MobilityData GTFS Validator](https://github.com/MobilityData/gtf
 
 ---
 
-## 3. Vehicle and Passenger Flow Plugin
+## 5. Refresh SDI derived layers
 
 **Purpose:**  
-Estimates vehicle and passenger flows per road segment based on GTFS data.
+Rebuilds derived tables and materialized views in the TfC SDI schema.
 
 **Inputs:**
-- GTFS `.zip` file (e.g. output from *GIS2GTFS*).  
-- PostGIS connection (standard schema from *RL2SDI* or following the schema described in the User Guide).  
+- SDI database or GeoPackage (standard schema).  
+- Optional setting to include QA layers.
+
+**Outputs:**
+- Updated derived tables (e.g. trips_view, trip_stops_sequence, od_stats).
+
+**Notes:**
+- Existing layers are overwritten.  
+- Missing optional layers are skipped with warnings.
+
+---
+
+## 6. Trip and Route Revenue Estimator
+
+**Purpose:**  
+Estimates revenue for transport routes and trips based on observed demand and fare assumptions.
+
+**Inputs:**
+- SDI database or GeoPackage (standard schema from *RL2SDI* or *RL2GPKG* or following the schema described in the User Guide).  
+- Fare assumptions.  
+- Output folder.
+
+**Outputs:**
+- Tables summarizing estimated revenue per trip and per route.
+
+**Use Cases:**
+- Service performance analysis  
+- Scenario testing for fares  
+- Planning and financial assessment
+
+---
+
+## 7. Vehicle and Passenger Flow Plugin
+
+**Purpose:**  
+Estimates vehicle and passenger flows per road segment using standardized SDI or GeoPackage data.
+
+**Inputs:**
+- PostGIS connection or GeoPackage (standard schema from *RL2SDI* or *RL2GPKG* or following the schema described in the User Guide).  
 - Output folder for generated files.
 
 **Process Summary:**
-1. Reads GTFS and extracts the geographic boundary.  
-2. Downloads and filters the OSM road network within that boundary.  
-3. Computes Fréchet distance between trip and road segments.  
+1. Builds trip segments from stop sequences.  
+2. Uses onboard survey data and OD statistics.  
+3. Applies headway information to estimate vehicle supply. 
 4. Calculates vehicle and passenger volumes per segment and time interval.  
 5. Outputs the results for visualization in QGIS.
 
 **Outputs:**
-- `vehicle_flow.gpkg` — Vehicle flow (morning and afternoon peaks)  
-- `passenger_flow.gpkg` — Passenger flow (morning and afternoon peaks)  
-
-**Main Output Fields:**
-| Field | Description |
-|--------|-------------|
-| `interval_name` | Time interval name |
-| `value` | Estimated passengers or vehicles per segment per hour |
+- `vehicle_passenger_flow.gpkg` — Vehicle and passenger flow layers  
 
 ---
 
@@ -137,7 +226,7 @@ See the [LICENSE](./LICENSE) file for details.
 
 ## Version
 
-**Current version:** 1.1  |  **Release date:** November 2025
+**Current version:** 2.0  |  **Release date:** April 2026
 
 ---
 

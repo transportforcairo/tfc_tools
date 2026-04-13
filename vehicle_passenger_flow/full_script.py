@@ -7,7 +7,6 @@ from .utils import utils
 from shapely.geometry import LineString, box, Point, MultiLineString, GeometryCollection
 import json
 from shapely.geometry import mapping
-import zipfile
 
 # import sys
 # plugin_dir = os.path.dirname(__file__)
@@ -216,214 +215,156 @@ def save_gdf_with_qgis_writer(gdf, out_path, layer_name, feedback=None):
             feedback.pushInfo(f"[OK] Wrote layer '{final_layer}' to {final_file}.")
 # --- end of QGIS writer: save GeoPandas GDF to disk without fiona/pyogrio ---
 
-def get_boundary_from_gtfs(gtfs_zip_path, feedback=None):
-    try:
-        if feedback:
-            feedback.pushInfo("Extracting boundary from GTFS zip...")
-
-        with zipfile.ZipFile(gtfs_zip_path, 'r') as z:
-            with z.open("stops.txt") as f:
-                stops_df = pd.read_csv(f)
-
-        # Ensure lat/lon exist
-        if not {"stop_lat", "stop_lon"}.issubset(stops_df.columns):
-            raise ValueError("GTFS stops.txt is missing stop_lat or stop_lon")
-
-        # Convert to GeoDataFrame
-        stops_gdf = gpd.GeoDataFrame(
-            stops_df,
-            geometry=[Point(xy) for xy in zip(stops_df["stop_lon"], stops_df["stop_lat"])],
-            crs="EPSG:4326"
-        )
-
-        # Option 1: bounding box with small buffer
-        bounds = stops_gdf.total_bounds
-        boundary = box(*bounds).buffer(0.01)
-
-        # Option 2 (optional): convex hull
-        # boundary = stops_gdf.unary_union.convex_hull.buffer(0.005)
-
-        if feedback:
-            feedback.pushInfo("Boundary extracted from GTFS successfully.")
-
-        return boundary
-
-    except Exception as e:
-        if feedback:
-            feedback.pushInfo(f"Failed to extract boundary from GTFS: {e}")
-        raise
-
-# sys.path.insert(1, "./utils/utils.py")
-
-# THIS PART IS FROM local_map_data_extractor PLUGIN FOR PIS
-import requests
-# Function to extract road data within the polygon layer's extent using Overpass API
-def extract_osm_roads(self, map_boundary, feedback=None):
-    if feedback:
-            feedback.pushInfo("Loading map boundary...")
-
-    # Ensure it’s in EPSG:4326 (WGS84 lat/lon)
-    if map_boundary.crs != 'EPSG:4326':
-        map_boundary = map_boundary.to_crs('EPSG:4326')
-
-    if feedback:
-            feedback.pushInfo("map boundary correct CRS is finished.")
-
-    # Calculate the extent (bounding box) of the entire polygon layer
-    bounds_polygon = map_boundary.total_bounds
-
-    # Combine the bounds to create a new bounding box
-    south = bounds_polygon[1]
-    west = bounds_polygon[0]
-    north = bounds_polygon[3]
-    east = bounds_polygon[2]
-
-    if feedback:
-        feedback.pushInfo("Bounding box for OSM query calculated.")
-
-
-    # Construct Overpass API query
-    overpass_url = "http://overpass-api.de/api/interpreter"
-    overpass_query = f"""
-    [out:json];
-    (
-    way["highway"]({south},{west},{north},{east});
-    );
-    out body;
-    >;
-    out skel qt;
-    """
-
-    # Fetch data from Overpass API
-    response = requests.get(overpass_url, params={'data': overpass_query})
-    # response.raise_for_status() # a line by ChatGPT that was not in local_map_data_extractor
-    if response.status_code != 200: # this part is by ChatGPT similar to the line above
-        if feedback:
-            feedback.pushInfo(f"Error: Overpass returned status code {response.status_code}")
-        return gpd.GeoDataFrame(columns=["road_type", "road_name", "geometry"], crs="EPSG:4326")
-
-    data = response.json()
-
-    if feedback:
-            feedback.pushInfo("fetch data from Overpass API is finished.")
-
-    # Parse the data to extract nodes and ways
-    elements = data['elements']
-    nodes = {el['id']: (el['lon'], el['lat']) for el in elements if el['type'] == 'node'}
-    ways = [el for el in elements if el['type'] == 'way']
-
-    if feedback:
-            feedback.pushInfo("parse data to extract nodes and ways is finished.")
-
-    edges = []
-
-    # Iterate over ways to process edges
-    for way in ways:
-        if 'tags' in way and 'highway' in way['tags']:
-            road_type = way['tags'].get('highway', 'Unknown')
-            road_name = way['tags'].get('name', None) # A NEW LINE BY CHATGPT THAT WAS NOT IN local_map_data_extractor plugin
-
-            coords = []
-            for node_id in way['nodes']:
-                if node_id in nodes:
-                    coords.append(nodes[node_id])
-            
-            if len(coords) >= 2:
-                geometry = LineString(coords)
-                edges.append({
-                            'gid': len(edges),  # unique ID for each row
-                            'road_type': road_type,
-                            'road_name': road_name,
-                            'geometry': geometry
-                        })  # NEW PART AS A REPLACEMENT TO THE LINES BELOW
-
-    if feedback:
-            feedback.pushInfo("Converted ways to LineString geometrie.")
-
-    feedback.pushInfo(f"Number of edges collected: {len(edges)}")
-    if len(edges) > 0:
-        feedback.pushInfo(f"Sample edge: {edges[0]}")
-
-    # Convert edges to a GeoDataFrame
-    gdf_edges = gpd.GeoDataFrame(edges, crs="EPSG:4326", geometry='geometry')
-
-
-    # Reproject polygon to match edges CRS (EPSG:4326)
-    map_boundary = map_boundary.to_crs(gdf_edges.crs)
-
-    # Clip roads to the actual polygon boundary (not just bounding box)
-    gdf_edges_clipped = gpd.clip(gdf_edges, map_boundary)
-    
-    print(f"Clipped road data To boundary")
-
-    return gdf_edges_clipped
-
 
 class FlowEstimator:
-    def __init__(self, gtfs_zip_path, connection, output_folder):
-        self.gtfs_zip_path = gtfs_zip_path
+    def __init__(self, connection, output_folder, sdi_mode='postgres', gpkg_path=None, analysis_config=None):
         self.connection = connection
         self.output_folder = output_folder
+        self.sdi_mode = sdi_mode
+        self.gpkg_path = gpkg_path
 
+        # Defaults (previously hard-coded)
         self.analysis_config = {
-            "trip_segments_segmentization_threshold_meters": 300,
-            "segment_matching_buffer_meters": 10,
-            "frechet_dist_densify_param": 0.1,
-            "frechet_dist_segment_length_ratio_max_thresh": 0.5, #revise this part
-        }   
+            "trip_segments_segmentization_threshold_meters": 300
+        }
+
+        # Allow algorithm UI to override.
+        if isinstance(analysis_config, dict):
+            self.analysis_config.update({k: analysis_config[k] for k in analysis_config if k in self.analysis_config})
 
     def download_required_layers(self, feedback=None):
         if feedback:
-            feedback.pushInfo("downloading required layers is starting.")
-        # os.makedirs(self.output_folder, exist_ok=True) # REMOVE this if not exporting files anymore
+            feedback.pushInfo("Loading required SDI layers")
 
-        # 1.1 Load raw.onboard_instances with WKT instead of native PostGIS geometry
-        onboard_instances_df = pd.read_sql(
-            "SELECT *, ST_AsText(geometry) AS geometry_wkt FROM raw.onboard_instances",
-            con=self.connection
-        )
+        if self.sdi_mode == 'postgres':
+            # Postgres: use engine-based readers where available
+            onboard_instances_df = pd.read_sql(
+                "SELECT *, ST_AsText(geometry) AS geometry_wkt FROM raw.onboard_instances",
+                con=self.connection
+            )
+            onboard_instances_df["geometry"] = gpd.GeoSeries.from_wkt(onboard_instances_df["geometry_wkt"])
+            onboard_instances = gpd.GeoDataFrame(
+                onboard_instances_df.drop(columns=["geometry_wkt"]),
+                geometry="geometry",
+                crs="EPSG:4326"
+            )
+
+            raw_stops = gpd.read_postgis(
+                "SELECT * FROM raw.stops",
+                con=self.connection,
+                geom_col="geom"
+            )
+            raw_stops = raw_stops.rename(columns={raw_stops.geometry.name: "geometry"}).set_geometry("geometry")
+            raw_stops = raw_stops.set_crs("EPSG:4326", allow_override=True)
+
+            intervals = pd.read_sql("SELECT * FROM transit.intervals", con=self.connection)
+            trips_intervals = pd.read_sql("SELECT * FROM transit.trips_intervals", con=self.connection)
+            trip_stops_sequence = pd.read_sql("SELECT * FROM transit.trip_stops_sequence", con=self.connection)
+            agencies = pd.read_sql("SELECT * FROM transit.agencies", con=self.connection)
+            vehicles = pd.read_sql("SELECT * FROM transit.vehicles", con=self.connection)
+            od_stats = pd.read_sql("SELECT * FROM transit.od_stats", con=self.connection)
+
+            trips_view = gpd.read_postgis(
+                "SELECT * FROM transit.trips_view",
+                con=self.connection,
+                geom_col="geom"
+            )
+            trips_view = trips_view.rename(columns={trips_view.geometry.name: "geometry"}).set_geometry("geometry")
+            trips_view = trips_view.set_crs("EPSG:4326", allow_override=True)
+            # After loading transit_trips_df (or trips_df)
+            trip_xwalk = trips_view[["gid", "observer_id"]].drop_duplicates()
+            trip_xwalk = trip_xwalk.rename(columns={"gid": "t_id", "observer_id": "trip_id"})
+            trip_xwalk["trip_id"] = trip_xwalk["trip_id"].astype(str).str.strip()
+
+        else:
+            from ..tfc_tools_common.sdi_io import SDISource, read_df, read_gdf
+            source = SDISource(mode='gpkg', gpkg_path=self.gpkg_path)
+
+            onboard_instances = read_gdf(source, "raw.onboard_instances", geom_col="geometry")
+            raw_stops = read_gdf(source, "raw.stops", geom_col="geom")
+            raw_stops = raw_stops.rename(columns={raw_stops.geometry.name: "geometry"}).set_geometry("geometry")
+            onboard_instances = onboard_instances.rename(columns={onboard_instances.geometry.name: "geometry"}).set_geometry("geometry")
+
+            intervals = read_df(source, "transit.intervals")
+            trips_intervals = read_df(source, "transit.trips_intervals")
+            trip_stops_sequence = read_df(source, "transit.trip_stops_sequence")
+            agencies = read_df(source, "transit.agencies")
+            vehicles = read_df(source, "transit.vehicles")
+            od_stats = read_df(source, "transit.od_stats")
+            trips_view = read_gdf(source, "transit.trips_view", geom_col="geom")
+            trips_view = trips_view.rename(columns={trips_view.geometry.name: "geometry"}).set_geometry("geometry")
 
         if feedback:
-            feedback.pushInfo("Loading raw.onboard_instances is finished.")
+            feedback.pushInfo("Finished loading SDI layers.")
+        
+        # ============================================================
+        # SDI NORMALIZATION: canonical trip_id = observer trip id (str)
+        # Place this right after loading SDI layers in full_script.py
+        # ============================================================
 
-        # Replace geometry column with one parsed from WKT, keep column name as 'geometry'
-        onboard_instances_df["geometry"] = gpd.GeoSeries.from_wkt(onboard_instances_df["geometry_wkt"])
-        onboard_instances = gpd.GeoDataFrame(
-            onboard_instances_df.drop(columns=["geometry_wkt"]),
-            geometry="geometry",
-            crs="EPSG:4326"
-        )
+        def _norm_str(s: pd.Series) -> pd.Series:
+            return s.astype(str).str.strip()
+
+        # ---- 1) Normalize trips_view -> ensure trip_id exists and is canonical ----
+        # Expect trips_view has observer_id (string id). Make it trip_id.
+        if "trip_id" not in trips_view.columns:
+            if "observer_id" in trips_view.columns:
+                trips_view = trips_view.rename(columns={"observer_id": "trip_id"})
+            else:
+                raise ValueError("trips_view_gdf must have observer_id or trip_id")
+
+        trips_view["trip_id"] = _norm_str(trips_view["trip_id"])
+
+        # ---- 2) Normalize trip_stops_sequence -> ensure trip_id matches trips_view.trip_id ----
+        # Prefer observer_trip_id if present (this is the matching universe).
+        if "trip_id" not in trip_stops_sequence.columns:
+            if "observer_trip_id" in trip_stops_sequence.columns:
+                trip_stops_sequence = trip_stops_sequence.rename(columns={"observer_trip_id": "trip_id"})
+            elif "trip_id" in trip_stops_sequence.columns:
+                pass
+            else:
+                raise ValueError("trip_stops_sequence_df must have observer_trip_id or trip_id")
+
+        trip_stops_sequence["trip_id"] = _norm_str(trip_stops_sequence["trip_id"])
+
+        # Keep internal id as t_id if it exists, but never treat it as trip_id
+        if "t_id" not in trip_stops_sequence.columns and "trip_id" in trip_stops_sequence.columns:
+            # do nothing; just avoid renaming internal ids incorrectly
+            pass
+
+        # ---- 3) Trip crosswalk (if t_id exists) for any tables still using internal ids ----
+        if "t_id" in trip_stops_sequence.columns:
+            trip_xwalk = trip_stops_sequence[["t_id", "trip_id"]].drop_duplicates()
+
+        # ---- 4) Normalize other tables that may carry trip identifiers ----
+        # onboard_instances usually has trip_id already. Make it string canonical.
+        if "trip_id" in onboard_instances.columns:
+            onboard_instances["trip_id"] = _norm_str(onboard_instances["trip_id"])
+
+        # ---- 5) Hard fail early if universes don't overlap ----
+        common = set(trips_view["trip_id"]).intersection(set(trip_stops_sequence["trip_id"]))
+        if len(common) == 0:
+            raise ValueError(
+                "No overlap between trips_view.trip_id and trip_stops_sequence.trip_id. "
+                "You likely have mixed trip id universes (observer_id vs internal t_id)."
+            )
 
         if feedback:
-            feedback.pushInfo("modifying raw.onboard_instances is finished.")
+            feedback.pushInfo(f"Normalized trip_id. trips_view unique trips: {trips_view['trip_id'].nunique()}")
+            feedback.pushInfo(f"Normalized trip_id. tss unique trips: {trip_stops_sequence['trip_id'].nunique()}")
+            feedback.pushInfo(f"Trip_id overlap count: {len(common)}")
 
-        # 1.2 Load raw.stops and join with raw.stops_created_at
-        raw_stops = gpd.read_postgis(
-            "SELECT *, geom AS geometry FROM raw.stops",  # I later added: mgeom AS geometry
-            con=self.connection,
-            geom_col="geometry"
-        )
-        stops_created_at = pd.read_sql("SELECT observer_id, created_at FROM raw.stops_created_at", con=self.connection)
-        raw_stops = raw_stops.merge(stops_created_at, on="observer_id", how="left")
-
-        if feedback:
-            feedback.pushInfo("Loading raw.stops is finished.")
-
-        # 2.1 Create bounding box
-        boundary = get_boundary_from_gtfs(self.gtfs_zip_path, feedback)
-        boundary_gdf = gpd.GeoDataFrame(geometry=[boundary], crs="EPSG:4326")
-
-        if feedback:
-            feedback.pushInfo("creating bounding box is finished.")
-
-        # 2.2 Download OSM road network
-        # run the function
-        road_gdf = extract_osm_roads(self, boundary_gdf, feedback)
-
-        if feedback:
-            feedback.pushInfo("Loading OSM road network is finished")
-
-        return onboard_instances, raw_stops, road_gdf
+        return {
+            "onboard_instances": onboard_instances,
+            "raw_stops": raw_stops,
+            "intervals": intervals,
+            "trips_intervals": trips_intervals,
+            "trip_stops_sequence": trip_stops_sequence,
+            "agencies": agencies,
+            "vehicles": vehicles,
+            "od_stats": od_stats,
+            "trips_view": trips_view,
+        }
     
 
     def run(self,feedback=None): # we added feedback=None between brackets to know if connection ran successfully. and modified processAlgorithm
@@ -431,357 +372,180 @@ class FlowEstimator:
             feedback.pushInfo("reading SDI data is starting.")
         # self.download_required_layers()
         logger.info("Downloading required layers...")
-        # onboard_instances, raw_stops, road_gdf = self.download_required_layers()
-        onboard_instances, raw_stops, road_gdf = self.download_required_layers(feedback)
+        logger.info("Loading SDI layers…")
+        layers = self.download_required_layers(feedback)
 
-        if feedback:
-            feedback.pushInfo("reading SDI data is finished.")
+        # CRS 3857 everywhere for metric work
+        raw_stops_gdf = layers["raw_stops"].to_crs(3857)
+        onboard_instances_gdf = layers["onboard_instances"].to_crs(3857)
+        trips_view_gdf = layers["trips_view"].to_crs(3857)
 
-        # Convert all to CRS 3857
-        road_segments_layer = road_gdf.to_crs(3857)
-        raw_stops_gdf = raw_stops.to_crs(3857)
-        onboard_instances_gdf = onboard_instances.to_crs(3857)
+        intervals_raw = layers["intervals"].copy()
+        if "name" in intervals_raw.columns and "interval_name" not in intervals_raw.columns:
+            intervals_raw = intervals_raw.rename(columns={"name": "interval_name"})
+        if "active" in intervals_raw.columns:
+            intervals_raw = intervals_raw[intervals_raw["active"].isin([True, 1, "1", "t", "T", "true", "TRUE"])].copy()
 
-        if feedback:
-            feedback.pushInfo("converting all layers to CRS 3857 is finished.")
-
-
-        logger.info("Extracting vehicle appearances")
-        (
-            veh_app,
-            transport_model,
-            candidates_base,
-            candidate_trip_segments,
-            matched_trip_segments,
-            trips_segments_gdf,
-            stops,
-            trip_instances,
-            temp2
-        ) = utils.get_vehicle_appearances(
-
-            self.gtfs_zip_path,
-            road_segments_gdf=road_segments_layer,
-            config=self.analysis_config,
-        )
-
-        all_vehicle_occurrences = gpd.GeoDataFrame(  #debug this function
-            pd.concat(
-                [
-                    veh_app.assign(gtfs="value"),
-                ]
-            )
-        )
-
-        logger.info("Generating time intervals from transit.intervals")
-        intervals_raw = pd.read_sql(
-            """
-            SELECT
-                start_time,
-                end_time,
-                name AS interval_name,
-                active
-            FROM transit.intervals
-            WHERE active = TRUE
-            ORDER BY start_time
-            """,
-            con=self.connection,
-        )
-
-        if intervals_raw.empty:
-            raise ValueError(
-                "No active intervals found in transit.intervals. "
-                "Please populate transit.intervals and mark at least one row as active."
-            )
-
-        # Convert start/end times (e.g. '06:00:00') to seconds from midnight
+        # build interval seconds
         intervals_df = (
-            intervals_raw
-            .assign(
+            intervals_raw.assign(
                 interval_start_secs=lambda df: pd.to_timedelta(df["start_time"].astype(str)).dt.total_seconds(),
                 interval_end_secs=lambda df: pd.to_timedelta(df["end_time"].astype(str)).dt.total_seconds(),
-            )[["interval_name", "interval_start_secs", "interval_end_secs"]]
+            )
+            .sort_values("interval_start_secs")
+            .reset_index(drop=True)
         )
 
-
-        logger.info("Classifying vehicle occurrences into intervals")
-        # Remove geometry for compatibility
-        veh_occ_df = all_vehicle_occurrences.drop(columns="geometry")
-
-        # Cartesian join and filter manually
-        veh_occ_df["key"] = 1
-        intervals_df["key"] = 1
-
-        merged_df = pd.merge(veh_occ_df, intervals_df, on="key").drop(columns="key")
-        all_vehicle_occurrences_intervals = merged_df[
-            (merged_df["timeofday_secs"] > merged_df["interval_start_secs"]) &
-            (merged_df["timeofday_secs"] < merged_df["interval_end_secs"])
-        ].copy()
-
-
-
-        logger.info("Generating vehicle flow layers")
-        veh_flow = (
-            road_segments_layer[["gid", "geometry"]]
-            .merge(
-                all_vehicle_occurrences_intervals.groupby(
-                    ["gid", "interval_name", "gtfs"], as_index=False
-                )["timeofday_secs"]
-                .count()
-                .pivot_table(
-                    values="timeofday_secs", columns="gtfs", index=["gid", "interval_name"]
-                )
-                .reset_index()
-                .reset_index(drop=True),
-                on="gid",
-                how="left",
-            )
-            .fillna(0)
+        # ---- SDI-only: build trip stop-pair segments (replaces GTFS stop_times + shapes) ----
+        trip_segments = utils.build_trip_stop_pair_segments_from_sdi(
+            trips_view_gdf=trips_view_gdf,
+            trip_stops_sequence_df=layers["trip_stops_sequence"],
+            agencies_df=layers["agencies"],
+            vehicles_df=layers["vehicles"],
         )
 
+        # deduplicated stop-pair segments backbone for final outputs
+        flow_stop_pair_segments = utils.build_flow_stop_pair_segments(trip_segments)
 
-        logger.info("Estimating average vehicle occupancy")
-        trips_segments_gdf, stops = utils.get_trips_segments_from_gtfs(self.gtfs_zip_path)
+        # ---- Vehicle flow (supply) from SDI ----
+        trips_intervals = layers["trips_intervals"].copy()
+        if "headway" in trips_intervals.columns and "headway_secs" not in trips_intervals.columns:
+            trips_intervals = trips_intervals.rename(columns={"headway": "headway_secs"})
 
-        (
-            avg_occupancy_per_trip_segment_per_interval,
-            onboard_segments_with_occupancy,
-            matched_stops,
-            filtered_stops,
-        ) = utils.get_avg_occupancy_per_segment_v2(
-            trips_segments_gdf,
-            intervals_df=intervals_df,
-            stops_gdf=stops,
-            raw_stops_gdf=raw_stops_gdf,
-            onboard_instances_gdf=onboard_instances_gdf,
-        )
+        # resolve interval_id join
+        intervals_join = intervals_raw.copy()
+        if "gid" in intervals_join.columns and "interval_id" not in intervals_join.columns:
+            intervals_join = intervals_join.rename(columns={"gid": "interval_id"})
+        if "id" in intervals_join.columns and "interval_id" not in intervals_join.columns:
+            intervals_join = intervals_join.rename(columns={"id": "interval_id"})
 
-        trips_gdf = utils.read_trips_gdf_from_gtfs(self.gtfs_zip_path)
-
-        logger.info("Interpolating for trips without onboard data")
-        trips_without_onboard_survey = trips_gdf[
-            ~trips_gdf["trip_id"].isin(
-                avg_occupancy_per_trip_segment_per_interval["trip_id"].unique()
-            )
-        ]
-
-        segments_of_trips_without_onboard_surveys = trips_segments_gdf[
-            ~trips_segments_gdf["trip_id"].isin(
-                avg_occupancy_per_trip_segment_per_interval["trip_id"].unique()
-            )
-        ].assign(geometry=lambda gdf: gdf.geometry.simplify(100))
-
-        segments_of_trips_with_onboard_surveys = trips_segments_gdf[
-            trips_segments_gdf["trip_id"].isin(
-                avg_occupancy_per_trip_segment_per_interval["trip_id"].unique()
-            )
-        ].assign(geometry=lambda gdf: gdf.geometry.simplify(100))
-
-        # --- helper: reduce any geometry to a single LineString (longest component) ---
-        def _to_single_linestring(geom):
-            if geom is None or geom.is_empty:
-                return None
-            if isinstance(geom, LineString):
-                return geom
-            if isinstance(geom, MultiLineString):
-                if not geom.geoms:
-                    return None
-                return max(geom.geoms, key=lambda g: g.length)
-            if isinstance(geom, GeometryCollection):
-                # prefer LineStrings
-                lines = [g for g in geom.geoms if isinstance(g, LineString)]
-                if lines:
-                    return max(lines, key=lambda g: g.length)
-                # fallback: longest MultiLineString sub-geom
-                mls = [g for g in geom.geoms if isinstance(g, MultiLineString)]
-                if mls:
-                    return max(mls, key=lambda g: g.length)
-                return None
-            # other geom types (Point/Polygon) aren't usable here
-            return None
-
-        # --- build the candidates (same spatial logic, safer geometry handling) ---
-        joined = (
-            gpd.overlay(
-                segments_of_trips_without_onboard_surveys[["trip_id", "segment_order", "geometry"]]
-                .assign(geom_buffered=lambda gdf: gdf.geometry.buffer(100))
-                .set_geometry("geom_buffered"),
-                segments_of_trips_with_onboard_surveys[["trip_id", "segment_order", "geometry"]],
-                keep_geom_type=False,
-            )
-            .merge(
-                trips_segments_gdf[["trip_id", "segment_order", "geometry"]],
-                left_on=["trip_id_2", "segment_order_2"],
-                right_on=["trip_id", "segment_order"],
-                suffixes=["_1", "_2"],
-            )
-        )
-
-        # compute a safe Frechet distance column (as a 1D Series) + lengths
-        def _safe_frechet(row):
-            g1 = _to_single_linestring(row.get("geometry_1"))
-            g2 = _to_single_linestring(row.get("geometry_2"))
-            if g1 is None or g2 is None:
-                return np.nan
-            try:
-                P = list(g1.coords)
-                Q = list(g2.coords)
-                if not P or not Q:
-                    return np.nan
-                # try both directions to be orientation-agnostic
-                return min(
-                    discrete_frechet(P, Q),
-                    discrete_frechet(list(reversed(P)), Q)
-                )
-            except Exception:
-                return np.nan
-
-        # create columns one by one (avoid assign/apply DataFrame-shape pitfalls)
-        vals = [ _safe_frechet(row) for _, row in joined.iterrows() ]
-        joined["frechet_dist"] = pd.to_numeric(pd.Series(vals, index=joined.index), errors="coerce")
-
-
-        # length of the 'from' geometry used in the ratio
-        joined["segment_length_meters"] = joined["geometry_1"].apply(
-            lambda g: (_to_single_linestring(g).length if _to_single_linestring(g) is not None else np.nan)
-        )
-
-        # acceptance rule (guard against division by zero/NaN)
-        joined["accepted"] = (joined["frechet_dist"] / joined["segment_length_meters"]) < 0.7
-
-
-
-
-        # continue with your original flow
-        joined_top_matches = (
-            joined.groupby(["trip_id_1", "trip_id_2"], as_index=False)["segment_order_2"]
-            .count()
-            .rename(columns={"segment_order_2": "n_matched_segments"})
-            .sort_values(["trip_id_1", "n_matched_segments"], ascending=False)
-            .groupby("trip_id_1")
-            .head(4)
-        )
-
-        joined_filtered = joined.merge(joined_top_matches, on=["trip_id_1", "trip_id_2"])
-
-        # all_vehicle_occurrences_intervals.interval_start_secs.unique()
-
-        avg_occupancy_per_trip_segment_per_interval_interpolated = (
-            joined_filtered[
-                ["trip_id_1", "segment_order_1", "trip_id_2", "segment_order_2"]
-            ]
-            .merge(
-                avg_occupancy_per_trip_segment_per_interval,
-                left_on=["trip_id_2", "segment_order_2"],
-                right_on=["trip_id", "segment_order"],
-            )
-            .groupby(
-                [
-                    "trip_id_1",
-                    "segment_order_1",
-                    "interval_name",
-                    "interval_start_secs",
-                    "interval_end_secs",
-                ]
-            )
-            .agg({"vehicle_occupancy": "median"})
-            .reset_index()
-            .rename(columns={"trip_id_1": "trip_id", "segment_order_1": "segment_order"})
-        )
-
-        avg_occupancy_per_trip_segment_per_interval_all = pd.concat(
-            [
-                avg_occupancy_per_trip_segment_per_interval.assign(interpolated=False),
-                avg_occupancy_per_trip_segment_per_interval_interpolated.assign(
-                    interpolated=True
-                ),
-            ]
-        )
-
-        logger.info("Joining occupancy data to vehicle appearances")
-        vehicle_appearances_with_avg_occupancy = all_vehicle_occurrences_intervals.merge(
-            avg_occupancy_per_trip_segment_per_interval_all.assign(
-                vehicle_occupancy=lambda df: df.vehicle_occupancy.clip(lower=0)
-            ),
-            on=[
-                "trip_id",
-                "segment_order",
-                "interval_name",
-                "interval_start_secs",
-                "interval_end_secs",
-            ],
+        intervals_join = intervals_join.merge(
+            intervals_df[["interval_name", "interval_start_secs", "interval_end_secs"]],
+            on="interval_name",
             how="left",
         )
+        intervals_join["interval_duration_secs"] = intervals_join["interval_end_secs"] - intervals_join["interval_start_secs"]
 
-        vehicle_appearances_with_avg_occupancy.loc[
-            vehicle_appearances_with_avg_occupancy['gtfs']=='value', 'vehicle_occupancy'
-        ] = vehicle_appearances_with_avg_occupancy.query("gtfs=='value'").assign(
-            vehicle_occupancy=lambda df: df.vehicle_occupancy.fillna(df.vehicle_occupancy.median())
-        )['vehicle_occupancy']
-
-        vehicle_appearances_with_avg_occupancy = vehicle_appearances_with_avg_occupancy.assign(
-            interpolated= lambda df: df.interpolated.fillna(True)
+        veh_supply = trips_intervals.merge(
+            intervals_join[["interval_id", "interval_name", "interval_duration_secs"]],
+            on="interval_id",
+            how="inner",
         )
 
-        logger.info("Generating passenger flow layers")
-        passenger_flow = (
-            road_segments_layer[["gid", "geometry"]]
+        if "trip_id" in veh_supply.columns:
+            veh_supply["trip_id"] = veh_supply["trip_id"].astype(str).str.strip()
+        else:
+            raise ValueError("veh_supply must have trip_id (canonical) or t_id (mappable).")
+
+        veh_supply["vehicle_trips_in_interval"] = np.floor(
+            (veh_supply["interval_duration_secs"] / veh_supply["headway_secs"]).replace([np.inf, -np.inf], np.nan).fillna(0)
+        )
+        
+
+        # ---- Occupancy using SDI segments + time proxy from transit.od_stats.duration ----
+        od_stats_df = layers["od_stats"].copy()
+
+        avg_occ, onboard_segments_with_occupancy, matched_stops, filtered_stops = utils.get_avg_occupancy_per_segment_v3_sdi_timeproxy(
+            trip_segments_gdf=trip_segments,
+            intervals_df=intervals_df,
+            raw_stops_gdf=raw_stops_gdf,
+            onboard_instances_gdf=onboard_instances_gdf,
+            od_stats_df=od_stats_df,
+            feedback=feedback
+        )
+
+        
+        trip_xwalk = trips_view_gdf[["gid", "trip_id"]].drop_duplicates()
+        trip_xwalk = trip_xwalk.rename(columns={"gid": "t_id"})
+        trip_xwalk["t_id"] = trip_xwalk["t_id"].astype(str).str.strip()        # Interpret current trip_segments.trip_id as internal id (gid)
+
+        # 3) Replace with observer trip_id
+        veh_supply = veh_supply.rename(columns={"trip_id": "t_id"})
+        veh_supply["t_id"] = veh_supply["t_id"].astype(str).str.strip()
+        veh_supply = (
+            veh_supply
+            .merge(trip_xwalk[["trip_id","t_id"]], on="t_id", how="left")
+        )
+
+        # 4) Fail fast if mapping didn’t work
+        # if trip_segments["trip_id"].isna().any():
+        #     raise ValueError("trip_segments: gid->observer_id mapping produced NaNs. Check that trip_segments.trip_id truly holds gid.")--
+        
+        disagg = (
+            trip_segments[["trip_id", "segment_order", "from_id", "to_id", "vehicle_name", "geometry"]]
+            .merge(veh_supply[["trip_id", "interval_name", "vehicle_trips_in_interval"]], on="trip_id", how="left")
             .merge(
-                vehicle_appearances_with_avg_occupancy.groupby(
-                    ["gid", "interval_name", "gtfs"], as_index=False
-                )["vehicle_occupancy"]
-                .sum()
-                .assign(vehicle_occupancy= lambda df: df.vehicle_occupancy.apply(np.ceil))
-                .pivot_table(
-                    values="vehicle_occupancy",
-                    columns="gtfs",
-                    index=["gid", "interval_name"]
-                )
-                .reset_index()
-                .reset_index(drop=True),
-                on="gid",
+                avg_occ.rename(columns={"vehicle_occupancy": "occ_median"}),
+                on=["trip_id", "segment_order", "interval_name"],
                 how="left",
             )
-            .fillna(0)
         )
 
-        veh_gpkg = os.path.join(self.output_folder, "vehicle_flow.gpkg")
+        disagg["vehicle_flow"] = disagg["vehicle_trips_in_interval"].fillna(0)
+        # conservative occupancy fallback (same spirit as your existing behavior)
+        disagg["occ_median"] = disagg["occ_median"].fillna(disagg["occ_median"].median())
+        disagg["occ_median"] = disagg["occ_median"].clip(lower=0)
+        disagg["passenger_flow"] = np.ceil(disagg["vehicle_flow"] * disagg["occ_median"]).fillna(0)
 
-        # Write one layer per active interval from transit.intervals
-        for interval_name in sorted(intervals_df["interval_name"].unique()):
-            interval_layer = veh_flow.query("interval_name == @interval_name")
-            if interval_layer.empty:
-                continue
-            save_gdf_with_qgis_writer(
-                interval_layer.set_crs(3857, inplace=False),
-                veh_gpkg,
-                interval_name,
-                feedback,
+        disagg_gdf = gpd.GeoDataFrame(disagg, geometry="geometry", crs="EPSG:3857")
+
+        # ---- Aggregate to stop-pair × interval (TALL) ----
+        tall = (
+            disagg_gdf.groupby(["from_id", "to_id", "interval_name"], as_index=False)[["vehicle_flow", "passenger_flow"]]
+            .sum()
+        )
+
+        flow_stop_pair_segments_overall = (
+            flow_stop_pair_segments
+            .drop(columns=["vehicle_name", "flow_seg_id"], errors="ignore")
+            .drop_duplicates(subset=["from_id", "to_id"])
+            .copy()
+        )
+
+        flow_stop_pair_segments_overall["flow_seg_id"] = (
+        flow_stop_pair_segments_overall["from_id"].astype(str)
+        + "__"
+        + flow_stop_pair_segments_overall["to_id"].astype(str)
+        )
+
+        tall_gdf = flow_stop_pair_segments_overall.merge(
+            tall,
+            on=["from_id", "to_id"],
+            how="left"
+        ).fillna(0)
+        tall_gdf = gpd.GeoDataFrame(tall_gdf, geometry="geometry", crs="EPSG:3857")
+
+        # ---- Pivot to WIDE (veh__<interval>, pax__<interval>) ----
+        def _safe(s):
+            return (
+                str(s).strip().lower()
+                .replace(" ", "_")
+                .replace("-", "_")
+                .replace("/", "_")
             )
 
-        pass_gpkg = os.path.join(self.output_folder, "passenger_flow.gpkg")
-        for interval_name in sorted(intervals_df["interval_name"].unique()):
-            interval_layer = passenger_flow.query("interval_name == @interval_name")
-            if interval_layer.empty:
-                continue
-            save_gdf_with_qgis_writer(
-                interval_layer.set_crs(3857, inplace=False),
-                pass_gpkg,
-                interval_name,
-                feedback,
+        wide = flow_stop_pair_segments_overall.copy()
+        for iname in intervals_df["interval_name"].unique():
+            key = _safe(iname)
+            sub = tall_gdf[tall_gdf["interval_name"] == iname][["from_id", "to_id", "vehicle_flow", "passenger_flow"]]
+            wide = wide.merge(
+                sub.rename(columns={
+                    "vehicle_flow": f"veh__{key}",
+                    "passenger_flow": f"pax__{key}",
+                }),
+                on=["from_id", "to_id"],
+                how="left",
             )
+        wide = wide.fillna(0)
+        wide_gdf = gpd.GeoDataFrame(wide, geometry="geometry", crs="EPSG:3857")
 
+        # ---- Write ONE output GeoPackage with ALL layers ----
+        out_gpkg = os.path.join(self.output_folder, "vehicle_passenger_flow.gpkg")
 
-
-        debug_groups = [("veh_flow total", veh_flow)]
-        for interval_name in sorted(intervals_df["interval_name"].unique()):
-            debug_groups.append(
-                (f"veh {interval_name}", veh_flow.query("interval_name == @interval_name"))
-            )
-
-        for name, df in debug_groups:
-            if feedback:
-                geom_ok = 0 if df.empty else (~df.geometry.is_empty).sum()
-                feedback.pushInfo(f"[DEBUG] {name}: rows={len(df)}, non-empty geoms={geom_ok}, crs={df.crs}")
+        save_gdf_with_qgis_writer(flow_stop_pair_segments_overall, out_gpkg, "analysis.flow_stop_pair_segments", feedback)
+        save_gdf_with_qgis_writer(disagg_gdf, out_gpkg, "analysis.flow_disagg_trip_interval", feedback)
+        save_gdf_with_qgis_writer(tall_gdf, out_gpkg, "analysis.flow_stop_pair_interval_tall", feedback)
+        save_gdf_with_qgis_writer(wide_gdf, out_gpkg, "analysis.flow_stop_pair_interval_wide", feedback)
 
 
 

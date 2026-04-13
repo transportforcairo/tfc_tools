@@ -1,5 +1,5 @@
-def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedback):
-    # %%
+def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedback, fallback_headway_secs=None):
+    
     import geopandas as gpd
     import pandas as pd
     import psycopg2
@@ -16,15 +16,10 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     import os
     def sql_path(filename):
         return os.path.join(os.path.dirname(__file__), filename)
-
-    # %%
-    import sqlalchemy
-    sqlalchemy.__version__
-
-    # %%
+    
     OBSERVER_PROJECT_ID = observer_project_id #MODIFIED THIS
 
-    # %%
+    
     def get_pg_connection_url(dbname, user, password, host, port):
         safe_password = urllib.parse.quote_plus(password)
         return f"postgresql+psycopg2://{user}:{safe_password}@{host}:{port}/{dbname}"
@@ -36,15 +31,14 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     feedback.pushInfo("RouteLab database is connected")
 
-    # %%
+    
     sdi_db_engine = create_engine(
         get_pg_connection_url(**sdi_db_params), pool_recycle=3600 #MODIFIED VARIABLE NAME HERE
     )
     city_db_con = sdi_db_engine.connect()
 
     feedback.pushInfo("City database is connected")
-
-    # %%
+    
     # NEW FUNCTION FOR EXECUTING SQL WITH PSYCOPG2 AND NOT SQLALCHEMY
     def run_ddl_sql(sql, connection):
         try:
@@ -56,7 +50,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         except Exception as e:
             raise RuntimeError(f"Failed to execute DDL: {e}")
 
-    # %%
+    
     trips = gpd.read_postgis(
         con=observer_db_con,
         sql=f"""
@@ -74,23 +68,23 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     feedback.pushInfo("City SQL is finished")
 
-    # %%
+    
     observer_setting_id = observer_db_con.execute(
         text(f"""select id from settings where project_id='{OBSERVER_PROJECT_ID}' and deleted_at is null""")
     ).first()[0]
 
-    # %%
+    
     # observer_setting_id
 
     feedback.pushInfo("observer_setting_id step is finished")
 
-    # %%
+    
 
     run_ddl_sql("CREATE EXTENSION IF NOT EXISTS postgis;", city_db_con)
 
     feedback.pushInfo("CREATE EXTENSION IF NOT EXISTS postgis is finished")
 
-    # %%
+    
 
     ''' trial 2 using psycopg - THIS ONE WORKED!! '''
     # import psycopg2
@@ -131,7 +125,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         );
     """, city_db_con)
 
-    # %%
+    
     # NEW FROM GITHUB UPDATE
     # Observer schema doesn't have any of the fields
     
@@ -144,7 +138,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     # there was a part specific to [69] about types of agencies that I did not add here
 
     run_ddl_sql("""
-        DROP TABLE if exists transit.agencies;
+        DROP TABLE if exists transit.agencies CASCADE;
         create table if not exists transit.agencies (
             gid SERIAL primary key,
             agency_id text,
@@ -166,7 +160,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     )
 
     # Insert vehicles and capture gid<->name mapping
-    insert_vehicle_sql = sqlalchemy.text("""
+    insert_vehicle_sql = text("""
     INSERT INTO transit.vehicles (name, passenger_capacity)
     VALUES (:name, :capacity)
     RETURNING gid, name
@@ -199,7 +193,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         })
 
     # 3) Insert agencies with FK to vehicles
-    insert_agencies_sql = sqlalchemy.text("""
+    insert_agencies_sql = text("""
         INSERT INTO transit.agencies
             (agency_id, agency_name, agency_url, agency_timezone, common_name, has_serial, vehicle_id)
         VALUES
@@ -214,11 +208,11 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
 
 
-    # %%
+    
     # NEW FROM GITHUB UPDATE
     pd.read_sql(con=city_db_con, sql=text("select * from transit.agencies"))
 
-    # %%
+    
     '''THE NEXT PART IS FULLY FROM THE NEW GITHUB'''
     
     ## Terminals
@@ -228,7 +222,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         geom_col="geometry",
     )
 
-    # %%
+    
     # Transform terminals
     valid_terminals = (
         terminals.copy()
@@ -239,7 +233,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     )
     valid_terminals = valid_terminals[~valid_terminals.name.str.lower().str.contains("test")]
 
-    # %%
+    
     # )  # NOTE: Always wrap raw SQL strings passed to .execute() with text(...) to deal with multi-line strings when working with sqlalchemy
    
     run_ddl_sql("DROP table if exists transit.terminals CASCADE;", city_db_con)
@@ -248,7 +242,6 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         create table if not exists transit.terminals (
             gid SERIAL primary key,
             name text,
-            name_ar text,
             geom GEOMETRY(GEOMETRY, 4326),
             observer_id text
         );
@@ -263,7 +256,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     feedback.pushInfo("transit.terminals is finished")
 
-    # %%
+    
     # Reading the intervals from Observer
     project_intervals = pd.read_sql(con=observer_db_con, sql=f"""
     select i.id, "start" ,"end", i.days, name, i.deleted_at 
@@ -303,7 +296,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         })
 
     # 3) Insert agencies with FK to vehicles
-    insert_intervals_sql = sqlalchemy.text("""
+    insert_intervals_sql = text("""
         INSERT INTO transit.intervals
             (start_time, end_time, observer_id, name, active)
         VALUES
@@ -314,7 +307,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     
     feedback.pushInfo("transit.intervals is finished")
 
-    # %%
+    
     # this part was relocated above as per the new version of the originaln script.ipynb
     sdi_intervals = pd.read_sql(
         con=city_db_con, sql="""select * from transit.intervals"""
@@ -358,7 +351,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         .rename({"gid": "agency_id"}, axis=1)
     )
 
-    # %%
+    
     '''the large section below was relocated from down to up here'''
 
     observer_trips = observer_trips.rename(
@@ -391,7 +384,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     observer_trips["service_id"] = "Ground_Daily"
 
-    # %%
+    
     frequency_instances = pd.read_sql(
         con=observer_db_con,
         sql=f"select * from v_frequency_instances_ext where setting_id='{observer_setting_id}' and deleted_at is null",
@@ -411,17 +404,12 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         .reset_index()
     )
 
-    valid_frequency_instances.query("trip_id == 'Cy2rV_BRB3PfJEgiazMtI'")
-
     valid_frequency_instances.avg_headway_sec.isna().sum()
 
     intervals = sdi_intervals[['gid', 'observer_id']].rename({"gid":"interval_gid", "observer_id":"interval"}, axis=1)
 
-    sdi_intervals
-
     trips = observer_trips.drop(['geom'], axis=1)
 
-    trips = observer_trips.drop(['geom'], axis=1)
     trips["gid"] = range(1, len(trips) + 1)
 
     trips = trips.merge(intervals, how='cross')
@@ -445,11 +433,17 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     trips['final_headway'] = np.floor(trips['avg_headway_sec'].fillna(
         trips['avg_ratio_headway'] * trips['avg_headway_agency_interval']))
 
-    (trips['avg_ratio_headway']).isna().sum()
+    # Optional user-provided fallback for any still-empty headways
+    if fallback_headway_secs is not None:
+        # Fill any remaining NaNs (and mark their method)
+        missing_mask = trips['final_headway'].isna()
+        if missing_mask.any():
+            trips.loc[missing_mask, 'final_headway'] = float(fallback_headway_secs)
+            trips.loc[missing_mask, 'headway_estimation_method'] = 'from_user_default'
 
     sdi_trips = observer_trips[['observer_id', 'geom']].merge(trips, on='observer_id').drop(['interval'],axis=1).drop_duplicates(subset=['observer_id'])
 
-    # %%
+    
     # Create trips table.
     # Add only the rows that have headway value
 
@@ -473,7 +467,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         """, city_db_con)
 
 
-    # %%
+    
 
     sdi_trips.sort_values("gid")[[
         "o_id",
@@ -498,10 +492,10 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         {"gid": "trip_id", "final_headway": "headway_secs", "interval_gid": "interval_id"}, axis=1
     )
 
-    # %%
+    
 
     run_ddl_sql("""
-        drop table if exists transit.trips_intervals;
+        drop table if exists transit.trips_intervals CASCADE;
         create table if not exists transit.trips_intervals (
             gid SERIAL primary key,
             trip_id integer references transit.trips(gid),
@@ -521,7 +515,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     trips.sort_values(['observer_route_id', 'interval_gid'])[['observer_id', 'interval_gid', 'avg_headway_sec']]
 
-    # %%
+    
     ## Apply update trips view
     with open(sql_path("updated_trips_view.sql")) as f:
         trips_view_sql_query = f.read()
@@ -532,18 +526,16 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
                 """, city_db_con)
 
 
-
-    # %% [markdown]
     # ## Raw data
     '''LARGE SECTION BELOW WAS RELOCATED FROM THE BOTTOM TO UP HERE.
     THIS IS THE LAST SECTION IN script.ipynb'''
 
-    # %%
+    
     sdi_agencies = pd.read_sql(
         con=city_db_con, sql="""select * from transit.agencies"""
     )
 
-    # %%
+    
     onboard_instances = gpd.read_postgis(
         con=observer_db_con,
         sql=f"""select * from v_onboard_instances_ext where project_id='{OBSERVER_PROJECT_ID}' and deleted_at is null and geometry is not null and ST_IsValid(geometry)""",
@@ -575,10 +567,9 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         ALTER TABLE raw.onboard_instances RENAME COLUMN matched_geom TO matched_geometry;
     """, city_db_con)
 
-    # %% [markdown]
     # ### Onboard Stops
 
-    # %%
+    
     raw_stops = gpd.read_postgis(
         con=observer_db_con,
         sql=f"""
@@ -593,10 +584,10 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         geom_col="geometry",
     )
 
-    # %%
+    
     raw_stops = raw_stops.rename(columns={'status':'parent_onboard_instance_status', 'valid':'parent_onboard_instance_valid'})
 
-    # %%
+    
     raw_stops = raw_stops.assign(
         board_male=lambda df: df.board_categorized.apply(lambda b: b['male'] if b else None),
         board_female=lambda df: df.board_categorized.apply(lambda b: b['female'] if b else None),
@@ -604,12 +595,9 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         alight_female=lambda df: df.alight_categorized.apply(lambda b: b['female'] if b else None)
     )
 
-    # raw_stops
-
-    # %%
     # Columns: gid, name, geom, board, alight, observer_id, onboard_instance_observer_id, h3_index (calculated by Observer)
 
-    run_ddl_sql("DROP table if exists raw.stops;", city_db_con)
+    run_ddl_sql("DROP table if exists raw.stops CASCADE;", city_db_con)
 
     run_ddl_sql("""
         create table if not exists raw.stops (
@@ -624,6 +612,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
             observer_id text,
             onboard_instance_observer_id text,
             h3_index text,
+            created_at timestamptz,
             parent_onboard_instance_status text,
             parent_onboard_instance_valid boolean,
             geom GEOMETRY(GEOMETRY, 4326)
@@ -631,7 +620,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         """, city_db_con) 
 
     raw_stops[
-        ["name", "geometry", "onboard_instance_id", "id", "board", "alight",  "board_male", "alight_male",  "board_female", "alight_female", "h3_index", "parent_onboard_instance_status", "parent_onboard_instance_valid"]
+        ["name", "geometry", "onboard_instance_id", "id", "board", "alight",  "board_male", "alight_male",  "board_female", "alight_female", "h3_index", "created_at", "parent_onboard_instance_status", "parent_onboard_instance_valid"]
     ].rename_geometry("geom").rename(
         columns={"onboard_instance_id": "onboard_instance_observer_id", "id": "observer_id"}
     ).to_postgis(
@@ -642,36 +631,10 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         dtype={"geom": Geometry("GEOMETRY", srid=4326)},
     )
 
-    # %%
-    # Columns: gid, name, geom, board, alight, observer_id, onboard_instance_observer_id, h3_index (calculated by Observer)
-
-    run_ddl_sql("DROP table if exists raw.stops_created_at;", city_db_con) 
-    
-
-    run_ddl_sql( """
-        create table if not exists raw.stops_created_at (
-            observer_id text,
-            created_at timestamptz
-        );
-        """, city_db_con) 
-    
-    raw_stops[
-        ["id", "created_at"]
-    ].rename(
-        columns={ "id": "observer_id"}
-    ).to_sql(
-        name="stops_created_at",
-        schema="raw",
-        con=city_db_con,
-        if_exists="replace",
-        index=False
-    )
     feedback.pushInfo("raw.stops is finished")
 
-    # %% [markdown]
     # ### Onboard Trackpoints
 
-    # %%
     trackpoints = gpd.read_postgis(
         con=observer_db_con,
         sql=f"""
@@ -686,13 +649,12 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         geom_col="geometry",
     )
 
-    # %%
+
     trackpoints = trackpoints.rename(columns={'status':'onboard_instance_status', 'valid':'onboard_instance_valid'})
 
-    # %%
     # Columns in city_cairo raw.trackpoints table: timestamp, geom, onboard_instance_id
 
-    run_ddl_sql("DROP table if exists raw.trackpoints;", city_db_con) 
+    run_ddl_sql("DROP table if exists raw.trackpoints CASCADE;", city_db_con) 
 
     run_ddl_sql("""
         create table if not exists raw.trackpoints (
@@ -717,9 +679,9 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     )
     feedback.pushInfo("raw.trackpoints is finished")
 
-    # %%
+    
     # city_db_con.execute(text("DROP table if exists raw.indentification_instances"))
-    run_ddl_sql("DROP table if exists raw.indentification_instances;", city_db_con)
+    run_ddl_sql("DROP table if exists raw.identification_instances CASCADE;", city_db_con)
 
     identification_instances = gpd.read_postgis(
         con=observer_db_con,
@@ -737,8 +699,8 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     )
     feedback.pushInfo("raw.identification is finished")
 
-    # %%
-    run_ddl_sql("DROP table if exists raw.frequency_instances;", city_db_con)
+    
+    run_ddl_sql("DROP table if exists raw.frequency_instances CASCADE;", city_db_con)
 
     frequency_instances = gpd.read_postgis(
         con=observer_db_con,
@@ -756,7 +718,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     )
     feedback.pushInfo("raw.frequency_instances is finished")
 
-    # %%
+    
     # TODO: LCTF continue from here. Waiting on stops digitization to be done.
     # UPDATE: Stops digitization automated by running this sql below
     with open(sql_path("create_processed_stops.sql")) as f:
@@ -774,7 +736,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     feedback.pushInfo("od_stats is finished")
 
 
-    # %%
+    
     # Reassign representative geometry to trips using updated algorithm (Frechet distance)
     city_db_con.execute(text( # I ADDED text() HERE
             f"""

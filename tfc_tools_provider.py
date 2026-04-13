@@ -40,8 +40,12 @@ import os
 from qgis.PyQt.QtCore import QCoreApplication
 
 from .rl2sdi.rl2sdi_algorithm import RL2SDIAlgorithm
+from .rl2sdi.export_routelab_to_gpkg_algorithm import ExportRouteLabToGeoPackageAlgorithm
 from .gis2gtfs.gis2gtfs_algorithm import GIS2GTFSAlgorithm
 from .vehicle_passenger_flow.vehicle_passenger_flow_algorithm import VehiclePassengerFlowAlgorithm
+from .sdi_tools.export_sdi_to_gpkg_algorithm import ExportSDIToGeoPackageAlgorithm
+from .sdi_tools.refresh_sdi_derived_algorithm import RefreshSDIDerivedLayersAlgorithm
+from .revenue_estimator.revenue_estimator_algorithm import RevenueEstimatorAlgorithm
 
 
 class TfCToolsProvider(QgsProcessingProvider):
@@ -107,8 +111,12 @@ class TfCToolsProvider(QgsProcessingProvider):
     def loadAlgorithms(self):
         # Register algorithms here. Grouping will be controlled by each Algorithm's group()/groupId()
         self.addAlgorithm(RL2SDIAlgorithm())
+        self.addAlgorithm(ExportRouteLabToGeoPackageAlgorithm())
+        self.addAlgorithm(ExportSDIToGeoPackageAlgorithm())
+        self.addAlgorithm(RefreshSDIDerivedLayersAlgorithm())
         self.addAlgorithm(GIS2GTFSAlgorithm())
         self.addAlgorithm(VehiclePassengerFlowAlgorithm())
+        self.addAlgorithm(RevenueEstimatorAlgorithm())
 
     def tr(self, string):
         return QCoreApplication.translate("TfCToolsProvider", string)

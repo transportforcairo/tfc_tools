@@ -46,7 +46,6 @@ def generate(data_dir, data_raw_dir, dwell_time_sec=15):
     intervals = pd.read_csv(os.path.join(data_raw_dir, "intervals.csv"))
     travel_times = pd.read_csv(os.path.join(data_raw_dir, "travel_times_trackpoints_filled_na.csv"))
     stop_seq = pd.read_csv(os.path.join(data_raw_dir, "trip_stop_sequence.csv"))
-    agency = pd.read_csv(os.path.join(data_raw_dir, "agency.csv"))[["gid", "agency_id", "vehicle_name"]]
     output_path = os.path.join(data_dir, "stop_times.txt")
 
     # ✅ Fix for schema mismatch: observer_trip_id → trip_id

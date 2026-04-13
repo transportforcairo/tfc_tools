@@ -30,6 +30,8 @@ __copyright__ = '(C) 2025 by Transport for Cairo'
 
 __revision__ = '$Format:%H$'
 
+from ..tfc_tools_common import ensure_deps
+
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
@@ -37,6 +39,7 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterString,
+                       QgsProcessingParameterNumber,
                        QgsProcessingParameterProviderConnection,
                        QgsApplication,
                        QgsProviderRegistry,
@@ -75,6 +78,7 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
     OBSERVER_CONN = 'observer_connection'
     SDI_CONN = 'sdi_connection'
     PROJECT_ID = 'project_id'
+    FALLBACK_HEADWAY = 'fallback_headway'
 
     def initAlgorithm(self, config=None):
         """
@@ -109,10 +113,28 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # 4. Optional fallback headway (seconds) for any remaining null values
+        p = QgsProcessingParameterNumber(
+            self.FALLBACK_HEADWAY,
+            "Headway (seconds) for empty values (optional)",
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=None,
+            optional=True,
+        )
+        # Keep it advanced to avoid cluttering the main UI
+        try:
+            p.setFlags(p.flags() | QgsProcessingParameterNumber.FlagAdvanced)
+        except Exception:
+            pass
+        self.addParameter(p)
+
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
         """
+
+        # Install PostGIS-mode Python deps only when running RL2SDI
+        ensure_deps()
 
         # Retrieve the feature source and sink. The 'dest_id' variable is used
         # to uniquely identify the feature sink, and must be included in the
@@ -123,6 +145,10 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
         sdi_conn_name = self.parameterAsConnectionName(parameters, self.SDI_CONN, context)
 
         project_id = self.parameterAsString(parameters, self.PROJECT_ID, context)
+        fallback_headway = self.parameterAsInt(parameters, self.FALLBACK_HEADWAY, context)
+        # QGIS returns 0 when unset for some builds; treat <=0 as unset
+        if fallback_headway is not None and fallback_headway <= 0:
+            fallback_headway = None
 
         feedback.pushInfo(f"Using Observer connection: {observer_conn_name}")
         feedback.pushInfo(f"Using SDI connection: {sdi_conn_name}")
@@ -158,7 +184,7 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
         }
 
         # Call the core logic function run_migration(), with the cleaned-up inputs
-        run_migration(observer_db_params, sdi_db_params, project_id, feedback)
+        run_migration(observer_db_params, sdi_db_params, project_id, feedback, fallback_headway)
         return {'RESULT': 'Migration completed successfully'}
 
 
@@ -203,17 +229,17 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
     It creates standardized <code>raw</code> and <code>transit</code> schemas in a PostGIS database, enabling further analysis or use with the other TfC Tools plugins (GIS2GTFS and Vehicle and Passenger Flow).<br>
 
     <b>How to Use the Plugin</b>
-    1. Select the RouteLab database connection (credentials provided by TfC).
-    2. Select the PostGIS SDI connection where the data will be migrated.
-    3. Enter the Project ID — the unique identifier for your RouteLab project.
-    4. Run the plugin to automatically generate and populate the <code>raw</code> and <code>transit</code> schemas.<br>
+    The plugin requires the following inputs:
+    1. RouteLab database connection (credentials provided by TfC)
+    2. PostGIS SDI connection where the data will be migrated
+    3. Enter the Project ID — the unique identifier for your RouteLab project<br>
 
     <b>Outputs</b>
     • <code>raw</code> schema: cleaned RouteLab data.
     • <code>transit</code> schema: processed, analysis-ready datasets.<br>
 
-    <b>More Information</b>
-    Full details and screenshots are available in the User Guide:
+    <b>Documenatation</b>
+    For more information, refer to the User Guide.
     <a href="https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf">TfC Tools User Guide</a>
     """)
 

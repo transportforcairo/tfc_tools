@@ -5,17 +5,24 @@
 [general]
 name=TfC Tools
 qgisMinimumVersion=3.40
-description=A suite of tools by Transport for Cairo: RouteLab to SDI migration, GIS2GTFS, and Vehicle & Passenger Flow.
-version=1.1
+description=A suite of tools by Transport for Cairo (TfC)
+version=2.0
 author=Transport for Cairo
 email=info@transportforcairo.com
 
-about=TfC Tools is a Processing provider with 3 algorithms developed by Transport for Cairo (TfC): 
-    1. RL2SDI — migrates RouteLab survey data into a standardized PostGIS SDI.
-    2. GIS2GTFS — builds a GTFS feed from a standardized SDI 
-    3. Vehicle and Passenger Flow — estimates vehicle flows and passenger flows per road segment from a GTFS feed.
-User Guide (PDF): https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf
-
+about=TfC Tools is a QGIS plugin suite developed by Transport for Cairo (TfC) to streamline and standardise transport data processing workflows.
+    The suite provides user-friendly interfaces for common analytical tasks used in TfC’s research and transport data management projects.
+    TfC Tools currently includes several tools organised into two groups:
+    1. RouteLab Tools: tools that migrate field survey data from TfC’s RouteLab database into standardised tables, either in GeoPackage format or in a PostGIS Spatial Data Infrastructure (SDI).
+       a. Export RouteLab to GeoPackage
+       b. Export SDI (PostGIS) to GeoPackage
+       c. RL2SDI (RouteLab to SDI Migration)
+    2. GIS Tools: tools for transport network analysis, GTFS generation, and transport metrics.
+       a. GIS2GTFS – converts GIS data into GTFS.
+       b. Refresh SDI derived layers – after manual GIS edits
+       c. Trip and Route Revenue Estimator
+       d. Vehicle and Passenger Flow Estimator
+    User Guide (PDF): https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf
 
 # Links
 homepage=https://transportforcairo.com
@@ -25,10 +32,16 @@ tracker=https://github.com/transportforcairo/tfc_tools/issues
 
 # Recommended items:
 hasProcessingProvider=yes
-changelog=Version 1.1:
-    • Dynamic time intervals pulled directly from the database instead of static “morning” and “afternoon” intervals.
-    • Lighter plugin version with fewer required libraries.
-    • Help panel updated with clearer explanations and a link to the User Guide PDF.
+changelog=Version 2.0:
+    • New tools: RL2GPKG, SDI2GPKG, Revenue Estimator, Refresh SDI
+    • GeoPackage input supported alongside PostgreSQL
+    • Vehicle and Passenger Flow updates
+    • Optional fallback headway for null values
+    Version 1.1:
+    • Dynamic time intervals pulled directly from the database instead of static “morning” and “afternoon” intervals
+    • Lighter plugin with fewer required libraries
+    • Help panel updated with clearer explanations and a link to the User Guide PDF
+
 
 # Tags are comma separated with spaces allowed
 tags=transport,transit,gtfs,postgis,gis,qgis,flows,geopandas,sdx,sdI,python

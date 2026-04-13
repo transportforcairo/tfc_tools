@@ -1,4 +1,4 @@
-DROP MATERIALIZED VIEW IF EXISTS transit.od_stats;
+DROP MATERIALIZED VIEW IF EXISTS transit.od_stats CASCADE;
 CREATE MATERIALIZED VIEW transit.od_stats AS (
     WITH RECURSIVE
     od_segments AS(
@@ -90,6 +90,7 @@ CREATE MATERIALIZED VIEW transit.od_stats AS (
             o_id,
             d_id,
             i.gid interval_id,
+            i.name interval_name,
             vehicle_name,
             min(tmp.from_id) as from_id,
             min(tmp.to_id) as to_id,
@@ -105,6 +106,7 @@ CREATE MATERIALIZED VIEW transit.od_stats AS (
             o_id,
             d_id,
             i.gid,
+            i.name,
             vehicle_name
     )
     SELECT
@@ -112,6 +114,7 @@ CREATE MATERIALIZED VIEW transit.od_stats AS (
 		o_id,
         d_id,
         interval_id,
+        interval_name,
         interval_start,
         vehicle_name,
         od_segments.dist as dist,

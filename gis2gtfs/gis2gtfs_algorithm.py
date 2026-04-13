@@ -39,8 +39,12 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterProviderConnection, # added
                        QgsProcessingParameterFolderDestination,
                        QgsProcessingParameterString,
-                       QgsProcessingParameterBoolean)  
+                       QgsProcessingParameterBoolean,
+                       QgsProcessingParameterEnum,
+                       QgsProcessingParameterFile,
+                       QgsProcessingParameterDefinition)  
 import os
+from ..tfc_tools_common import ensure_deps
 from .build import run_gtfs_pipeline
 
 # for icon
@@ -71,6 +75,8 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
     # used when calling the algorithm from another algorithm, or when
     # calling from the QGIS console.
 
+    SDI_SOURCE = 'SDI_SOURCE'
+    SDI_GPKG = 'SDI_GPKG'
     CONN_NAME = 'CONN_NAME'
     DATA_RAW_DIR = 'DATA_RAW_DIR'
     DATA_DIR = 'DATA_DIR'
@@ -86,12 +92,49 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
         with some other properties.
         """
 
-        # 1. SDI DB connection
+        # 0. SDI source selector (PostGIS vs GeoPackage)
+        # Use a widget wrapper so the unused input below is visually disabled (standard QGIS UX).
+        src_param = QgsProcessingParameterEnum(
+            self.SDI_SOURCE,
+            self.tr('SDI data source'),
+            options=[
+                self.tr('PostGIS (QGIS connection)'),
+                self.tr('GeoPackage (RouteLab SDI export)')
+            ],
+            defaultValue=0
+        )
+        src_param.setMetadata(
+            {
+                'widget_wrapper': {
+                    'class': 'tfc_tools.tfc_tools_common.sdi_source_toggle_wrapper.SDISourceToggleWidgetWrapper',
+                    'enable_map': {
+                        '0': [self.CONN_NAME],   # PostGIS
+                        '1': [self.SDI_GPKG],    # GeoPackage
+                    }
+                }
+            }
+        )
+        self.addParameter(src_param)
+
+        # 1. SDI DB connection (PostGIS)
+        # NOTE: kept optional so the dialog can be either/or with GeoPackage.
+        # We enforce the requirement via checkParameterValues depending on SDI_SOURCE.
+        conn_param = QgsProcessingParameterProviderConnection(
+            self.CONN_NAME,
+            self.tr('SDI PostGIS connection (required when SDI data source = PostGIS)'),
+            provider='postgres'
+        )
+        conn_param.setFlags(conn_param.flags() | QgsProcessingParameterDefinition.FlagOptional)
+        self.addParameter(conn_param)
+
+        # 1b. SDI GeoPackage (file)
         self.addParameter(
-            QgsProcessingParameterProviderConnection(
-                self.CONN_NAME,
-                self.tr('PostgreSQL SDI Connection'), 
-                provider='postgres'
+            QgsProcessingParameterFile(
+                self.SDI_GPKG,
+                self.tr('SDI GeoPackage (required when SDI data source = GeoPackage)'),
+                behavior=QgsProcessingParameterFile.File,
+                fileFilter='GeoPackage (*.gpkg)',
+                optional=True
             )
         )
 
@@ -150,11 +193,47 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
         )
 
 
+    def checkParameterValues(self, parameters, context):
+        """Make the UI effectively either/or: exactly one input is required depending on SDI_SOURCE."""
+        source_mode = self.parameterAsEnum(parameters, self.SDI_SOURCE, context)
+        if source_mode == 0:
+            # Install PostGIS-mode deps only when needed
+            ensure_deps()
+        source_mode = self.parameterAsEnum(parameters, self.SDI_SOURCE, context)
+        if source_mode == 0:
+            # Install PostGIS-mode deps only when needed
+            ensure_deps()
+        conn_name = self.parameterAsString(parameters, self.CONN_NAME, context)
+        gpkg_path = self.parameterAsFile(parameters, self.SDI_GPKG, context)
+        gpkg_path = self.parameterAsFile(parameters, self.SDI_GPKG, context)
+
+        if source_mode == 0:
+            # PostGIS
+            if not conn_name:
+                return (False, self.tr('Please choose an SDI PostGIS connection (required when SDI data source = PostGIS).'))
+        else:
+            # GeoPackage
+            if not gpkg_path:
+                return (False, self.tr('Please select an SDI GeoPackage file (required when SDI data source = GeoPackage).'))
+            import os
+            if not os.path.exists(gpkg_path):
+                return (False, self.tr('The selected GeoPackage path does not exist.'))
+            if not gpkg_path.lower().endswith('.gpkg'):
+                return (False, self.tr('The selected file is not a .gpkg GeoPackage.'))
+
+        return super().checkParameterValues(parameters, context)
+
+
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
         """
+        source_mode = self.parameterAsEnum(parameters, self.SDI_SOURCE, context)
+        if source_mode == 0:
+            # Install PostGIS-mode deps only when needed
+            ensure_deps()
         conn_name = self.parameterAsString(parameters, self.CONN_NAME, context)
+        gpkg_path = self.parameterAsFile(parameters, self.SDI_GPKG, context)
         data_raw_dir = self.parameterAsString(parameters, self.DATA_RAW_DIR, context)
         data_dir = self.parameterAsString(parameters, self.DATA_DIR, context)
         feed_name = self.parameterAsString(parameters, self.FEED_NAME, context)
@@ -165,7 +244,9 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
 
         # Call the GTFS build pipeline
         run_gtfs_pipeline(
-            conn_name=conn_name,
+            sdi_mode='postgres' if source_mode == 0 else 'gpkg',
+            conn_name=conn_name if source_mode == 0 else None,
+            gpkg_path=gpkg_path if source_mode == 1 else None,
             data_raw_dir=data_raw_dir,
             data_dir=data_dir,
             feed_name=feed_name,
@@ -219,28 +300,26 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr("""
     <b>Purpose of the Plugin</b>
-    The GIS2GTFS Plugin automates the creation of a General Transit Feed Specification (GTFS) dataset from existing transport data stored in a PostgreSQL SDI. 
-    It relies on TfC’s standardized schema (the same one produced by the RL2SDI plugin) to ensure consistency and interoperability.<br>
+    The plugin generates a General Transit Feed Specification (GTFS) dataset from transport data stored in a standardized TfC schema.
+    The input can be either a PostgreSQL SDI database or a GeoPackage following the same structure.<br>
 
     <b>How to Use the Plugin</b>
-    1. Choose your PostgreSQL SDI connection (from RL2SDI output or a database following the same schema).
-    2. Enter feed details:
-    &nbsp;&nbsp;&nbsp;&nbsp;• Feed version (e.g. 1.0)
-    &nbsp;&nbsp;&nbsp;&nbsp;• Start date (e.g. 20250101)
-    &nbsp;&nbsp;&nbsp;&nbsp;• End date (e.g. 20251231)
-    &nbsp;&nbsp;&nbsp;&nbsp;• Service ID (e.g. Ground_Daily)
-    3. Keep “Use continuous drop-off/pick-up” checked unless you need to disable it.
-    4. Select two output folders:
-    &nbsp;&nbsp;&nbsp;&nbsp;• Folder 1 – temporary raw files (internal use, can be deleted later).
-    &nbsp;&nbsp;&nbsp;&nbsp;• Folder 2 – final GTFS <code>.txt</code> files.
-    5. Run the plugin to generate the GTFS feed.<br>
+    The plugin requires the following inputs:
+    1. SDI or GeoPackage dataset following TfC’s standard schema (e.g. output from RL2SDI or RL2GPKG)
+    2. Feed version (e.g. 1.0)
+    3. Start date (YYYYMMDD)
+    4. End date (YYYYMMDD)
+    5. Service ID (e.g. Ground_Daily)
+    6. Use continuous drop-off/pick-up (enabled by default)
+    7. Output folder 1 – temporary files (recommended: empty folder)
+    8. Output folder 2 – final GTFS files<br>
 
     <b>Outputs</b>
-    • Folder 1: raw intermediate files (not required afterwards).
-    • Folder 2: GTFS dataset (9 text files forming a valid feed).<br>
+    • Intermediate files in Folder 1
+    • GTFS feed (.txt files) in Folder 2<br>
 
-    <b>More Information</b>
-    For schema requirements and validation guidance, see the User Guide:
+    <b>Documentation</b>
+    For more information, refer to the User Guide.
     <a href="https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf">TfC Tools User Guide</a>
     """)
 

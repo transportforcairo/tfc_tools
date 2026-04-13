@@ -1,63 +1,57 @@
 import os
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import create_engine
-import urllib.parse
-from qgis.core import QgsProviderRegistry
-from qgis.core import QgsProviderRegistry, QgsDataSourceUri
 
-# NOTE: If you got an error on QGIS saying: ModuleNotFoundError: No module named 'sqlalchemy'
-# the solution is to do the following: 
-# Open OSGeo4W Shell 
-# Run the following command inside the OSGeo4W shell: python3 -m pip install sqlalchemy
-# and You can confirm it worked by running: python3 -c "import sqlalchemy; print(sqlalchemy.__version__)"
+# NOTE: QGIS loads plugins as packages under the plugin folder.
+# Use relative imports so module resolution works regardless of sys.path.
+from ...tfc_tools_common.sdi_io import SDISource, read_df, read_gdf
 
-
-def download_db_data(conn_name, output_dir):
+def download_db_data(sdi_mode, conn_name, gpkg_path, output_dir):
     """
-    Connect to the SDI PostgreSQL database and export all relevant transit tables
-    to CSV and GeoJSON files for GTFS construction.
+    Export all relevant SDI tables to CSV and GeoJSON files for GTFS construction.
+    Supports either:
+      - Postgres (QGIS connection name), or
+      - GeoPackage (tfc_rl_sdi_gpkg schema)
 
     Parameters:
-        conn_name (str): Name of the PostgreSQL connection in QGIS
+        sdi_mode (str): 'postgres' or 'gpkg'
+        conn_name (str|None): Name of the PostgreSQL connection in QGIS (postgres mode)
+        gpkg_path (str|None): Path to GeoPackage (gpkg mode)
         output_dir (str): Directory to save exported files
     """
 
-    # 🔍 Look up the PostgreSQL connection from QGIS
-    provider = QgsProviderRegistry.instance().providerMetadata("postgres")
-    connection = provider.findConnection(conn_name)
+    source = SDISource(
+        mode=sdi_mode,
+        conn_name=conn_name,
+        gpkg_path=gpkg_path,
+    )
+    source.validate()
 
-    if connection is None:
-        raise ValueError(f"Could not find PostgreSQL connection named '{conn_name}' in QGIS.")
-
-    # uri = connection.uri()
-    uri_str = connection.uri()
-    uri = QgsDataSourceUri(uri_str)  # ✅ Parse the URI string properly
-    db_name = uri.database()
-    db_user = uri.username()
-    db_password = uri.password()
-    db_host = uri.host()
-    db_port = uri.port()
-
-    # Create output folder
     os.makedirs(output_dir, exist_ok=True)
 
-    # 👇 encode the password to be URL-safe 
-    # (This ensures special characters like @, &, %, : are treated correctly by the URL parser.)
-    safe_password = urllib.parse.quote_plus(db_password)
-
-    # Connect to the database using SQLAlchemy (safe connection string)
-    conn_str = f"postgresql://{db_user}:{safe_password}@{db_host}:{db_port}/{db_name}"
-    engine = create_engine(conn_str)
-    conn = engine.connect()
-    print("✅ Connected to the database.")
-
     # -------------------- agency -------------------- #
-    agency_df = pd.read_sql_table("agencies", con=engine, schema="transit")
-    vehicles_df = pd.read_sql_table("vehicles", con=engine, schema="transit")
-    vehicles_df = vehicles_df.drop(columns="gid", errors="ignore") # this line is to avoid having "gid" in vehicles and agency, and the errors="ignore" was during plugin modifications
-    agency_df = agency_df.merge(vehicles_df, left_on="vehicle_id", right_index=True, how="left")
-    agency_df.rename(columns={"name": "vehicle_name"}, inplace=True)
+    agency_df = read_df(source, "transit.agencies")
+    vehicles_df = read_df(source, "transit.vehicles")
+
+    # Robust join on vehicles.gid (not DataFrame index)
+    if "gid" in vehicles_df.columns:
+        agency_df = agency_df.merge(
+            vehicles_df[[c for c in ["gid", "name", "passenger_capacity"] if c in vehicles_df.columns]],
+            left_on="vehicle_id",
+            right_on="gid",
+            how="left",
+            suffixes=("", "_veh"),
+        )
+        agency_df.drop(columns=["gid"], inplace=True, errors="ignore")
+    else:
+        # fallback (should not happen in TfC schema)
+        agency_df = agency_df.merge(vehicles_df, left_on="vehicle_id", right_index=True, how="left")
+
+    if "name" in agency_df.columns:
+        agency_df.rename(columns={"name": "vehicle_name"}, inplace=True)
+    elif "name_veh" in agency_df.columns:
+        agency_df.rename(columns={"name_veh": "vehicle_name"}, inplace=True)
+
     agency_df.to_csv(os.path.join(output_dir, "agency.csv"), index=False)
 
     pickup_dropoff = agency_df[["agency_id", "has_serial"]].copy()
@@ -66,40 +60,39 @@ def download_db_data(conn_name, output_dir):
     pickup_dropoff.drop(columns=["has_serial"], inplace=True)
 
     # -------------------- stops -------------------- #
-    stops_query = "SELECT * FROM transit.stops"
-    stops_gdf = gpd.read_postgis(stops_query, con=conn)
+    stops_gdf = read_gdf(source, "transit.stops")
     stops_gdf.to_file(os.path.join(output_dir, "stops.geojson"), driver="GeoJSON")
 
     # -------------------- trips -------------------- #
-    trips_query = "SELECT * FROM transit.trips_view WHERE geom IS NOT NULL"
-    trips_gdf = gpd.read_postgis(trips_query, con=conn)
+    trips_gdf = read_gdf(source, "transit.trips_view", where="geom IS NOT NULL" if source.mode == "postgres" else None)
+    if source.mode == "gpkg":
+        trips_gdf = trips_gdf[~trips_gdf.geometry.isna()].copy()
     trips_gdf = trips_gdf.merge(pickup_dropoff, on="agency_id", how="left")
     trips_gdf.to_file(os.path.join(output_dir, "trips.geojson"), driver="GeoJSON")
 
     # -------------------- terminals -------------------- #
-    terminals_query = "SELECT * FROM transit.terminals"
-    terminals_gdf = gpd.read_postgis(terminals_query, con=conn)
+    terminals_gdf = read_gdf(source, "transit.terminals")
     terminals_gdf.to_file(os.path.join(output_dir, "terminals.geojson"), driver="GeoJSON")
 
     # -------------------- intervals -------------------- #
-    intervals_query = "SELECT * FROM transit.intervals WHERE active = TRUE"
-    intervals_df = pd.read_sql_query(intervals_query, con=engine)
+    intervals_df = read_df(source, "transit.intervals")
+    if "active" in intervals_df.columns:
+        intervals_df = intervals_df[intervals_df["active"].isin([True, 1, "1", "t", "T", "true", "TRUE"])]
     intervals_df.to_csv(os.path.join(output_dir, "intervals.csv"), index=False)
 
     # -------------------- frequencies -------------------- #
-    frequencies_df = pd.read_sql_table("trips_intervals", con=engine, schema="transit")
+    frequencies_df = read_df(source, "transit.trips_intervals")
     frequencies_df = frequencies_df[frequencies_df["interval_id"].isin(intervals_df["gid"])]
     frequencies_df.to_csv(os.path.join(output_dir, "frequencies.csv"), index=False)
 
     # -------------------- trip stop sequence -------------------- #
-    tss_df = pd.read_sql_table("trip_stops_sequence", con=engine, schema="transit")
+    tss_df = read_df(source, "transit.trip_stops_sequence")
     tss_df = tss_df.drop(columns=["gid"], errors="ignore")
     tss_df.to_csv(os.path.join(output_dir, "trip_stop_sequence.csv"), index=False)
 
     # -------------------- travel time OD stats -------------------- #
-    travel_df = pd.read_sql_table("od_stats", con=engine, schema="transit")
+    travel_df = read_df(source, "transit.od_stats")
     travel_df = travel_df[["o_id", "d_id", "interval_id", "interval_start", "duration", "vehicle_name"]]
     travel_df.to_csv(os.path.join(output_dir, "travel_times_trackpoints.csv"), index=False)
 
-    conn.close()
     print("✅ All data successfully downloaded and saved.")

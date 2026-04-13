@@ -30,9 +30,8 @@ __copyright__ = '(C) 2025 by Transport for Cairo'
 
 __revision__ = '$Format:%H$'
 
-from .deps import ensure_deps
-ensure_deps()
-
+from ..tfc_tools_common import ensure_paths, ensure_deps
+ensure_paths()
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
@@ -40,14 +39,14 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterFeatureSink,
                        QgsProcessingParameterFile,
+                       QgsProcessingParameterNumber,
+                       QgsProcessingParameterEnum,
                        QgsProcessingParameterProviderConnection,
                        QgsProcessingParameterString,
-                       QgsProcessingParameterFolderDestination)
+                       QgsProcessingParameterFolderDestination,
+                       QgsProcessingParameterDefinition)
 from .full_script import FlowEstimator
 
-from qgis.core import QgsProviderRegistry, QgsDataSourceUri, QgsSettings
-from sqlalchemy import create_engine
-import urllib.parse
 
 # for icon
 from qgis.PyQt.QtGui import QIcon
@@ -59,40 +58,6 @@ def _icon_path(*parts):
     root = os.path.abspath(os.path.join(here, ".."))     # tfc_tools/
     return os.path.join(root, *parts)
 
-def connect_postgis(connection_name, feedback=None):
-    """
-    Returns a SQLAlchemy connection engine for a QGIS PostGIS connection.
-    """
-    
-    settings = QgsSettings()
-    base_key = f"/PostgreSQL/connections/{connection_name}"
-
-    db = settings.value(f"{base_key}/database")
-    user = settings.value(f"{base_key}/username")
-    password = settings.value(f"{base_key}/password") or ""
-    host = settings.value(f"{base_key}/host")
-    port = settings.value(f"{base_key}/port") or "5432"
-
-    if feedback:
-        feedback.pushInfo("[DEBUG] Fetched connection settings from QGIS:")
-        feedback.pushInfo(f"  Host: {host}")
-        feedback.pushInfo(f"  Database: {db}")
-        feedback.pushInfo(f"  User: {user}")
-        feedback.pushInfo(f"  Port: {port}")
-
-    # URL-encode the password to avoid issues with special characters
-    safe_password = urllib.parse.quote_plus(password)
-
-    connection_url = f"postgresql://{user}:{safe_password}@{host}:{port}/{db}"
-    
-    if feedback:
-        feedback.pushInfo(f"[DEBUG] SQLAlchemy connection URL: {connection_url}")
-
-    engine = create_engine(connection_url)
-    return engine
-
-
-
 class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
     def initAlgorithm(self, config):
         """
@@ -100,23 +65,53 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
         with some other properties.
         """
 
-        self.addParameter(
-            QgsProcessingParameterFile(
-                'GTFS_ZIP',
-                'GTFS Zip File',
-                behavior=QgsProcessingParameterFile.File,
-                fileFilter='Zip files (*.zip)'
-            )
+        # SDI source selector (with visual enable/disable for mutually exclusive inputs)
+        src_param = QgsProcessingParameterEnum(
+            'SDI_SOURCE',
+            'SDI data source',
+            options=[
+                'PostGIS (QGIS connection)',
+                'GeoPackage (RouteLab SDI export)'
+            ],
+            defaultValue=0
         )
+        src_param.setMetadata(
+            {
+                'widget_wrapper': {
+                    'class': 'tfc_tools.tfc_tools_common.sdi_source_toggle_wrapper.SDISourceToggleWidgetWrapper',
+                    'enable_map': {
+                        '0': ['SDI_CONNECTION'],
+                        '1': ['SDI_GPKG'],
+                    }
+                }
+            }
+        )
+        self.addParameter(src_param)
 
         self.addParameter(
             QgsProcessingParameterProviderConnection(
                 'SDI_CONNECTION',
-                'PostgreSQL SDI Connection for the needed project',
+                'SDI PostGIS connection (required when SDI data source = PostGIS)',
                 provider='postgres'
             )
         )
 
+        # Mark optional to allow either/or with GeoPackage; enforced in checkParameterValues.
+        self.parameterDefinition('SDI_CONNECTION').setFlags(
+            self.parameterDefinition('SDI_CONNECTION').flags() | QgsProcessingParameterDefinition.FlagOptional
+        )
+
+        self.addParameter(
+            QgsProcessingParameterFile(
+                'SDI_GPKG',
+                'SDI GeoPackage (required when SDI data source = GeoPackage)',
+                behavior=QgsProcessingParameterFile.File,
+                fileFilter='GeoPackage (*.gpkg)',
+                optional=True
+            )
+        )
+
+        # Output folder
         self.addParameter(
             QgsProcessingParameterFolderDestination(
                 'OUTPUT_FOLDER',
@@ -124,17 +119,67 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # Advanced tuning parameters (expose FlowEstimator.analysis_config)
+        p = QgsProcessingParameterNumber(
+            'TRIP_SEGMENTIZATION_THRESHOLD_M',
+            'Trip segments: segmentization threshold (meters)',
+            type=QgsProcessingParameterNumber.Integer,
+            defaultValue=300,
+            minValue=1,
+        )
+        p.setFlags(p.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        self.addParameter(p)
+
+
+    def checkParameterValues(self, parameters, context):
+        """Enforce either/or input based on SDI_SOURCE."""
+        source_mode = self.parameterAsEnum(parameters, 'SDI_SOURCE', context)
+        connection_name = self.parameterAsString(parameters, 'SDI_CONNECTION', context)
+        gpkg_path = self.parameterAsFile(parameters, 'SDI_GPKG', context)
+
+
+        if source_mode == 0:
+            if not connection_name:
+                return (False, self.tr('Please choose an SDI PostGIS connection (required when SDI data source = PostGIS).'))
+        else:
+            if not gpkg_path:
+                return (False, self.tr('Please select an SDI GeoPackage file (required when SDI data source = GeoPackage).'))
+            import os
+            if not os.path.exists(gpkg_path):
+                return (False, self.tr('The selected GeoPackage path does not exist.'))
+            if not gpkg_path.lower().endswith('.gpkg'):
+                return (False, self.tr('The selected file is not a .gpkg GeoPackage.'))
+
+        return super().checkParameterValues(parameters, context)
+
 
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
         """
-        gtfs_path = self.parameterAsFile(parameters, 'GTFS_ZIP', context)
         output_folder = self.parameterAsString(parameters, 'OUTPUT_FOLDER', context)
+        source_mode = self.parameterAsEnum(parameters, 'SDI_SOURCE', context)
         connection_name = self.parameterAsString(parameters, 'SDI_CONNECTION', context)
-        connection = connect_postgis(connection_name, feedback=feedback)
+        gpkg_path = self.parameterAsFile(parameters, 'SDI_GPKG', context)
 
-        estimator = FlowEstimator(gtfs_path, connection, output_folder)
+        analysis_config = {
+            "trip_segments_segmentization_threshold_meters": int(self.parameterAsInt(parameters, 'TRIP_SEGMENTIZATION_THRESHOLD_M', context))
+        }
+
+        connection = None
+        if source_mode == 0:
+            # Install PostGIS-mode Python deps only when needed
+            ensure_deps()
+            from ..tfc_tools_common.sdi_io import postgres_engine_from_qgis_connection
+            connection = postgres_engine_from_qgis_connection(connection_name)
+
+        estimator = FlowEstimator(
+            connection=connection,
+            output_folder=output_folder,
+            sdi_mode='postgres' if source_mode == 0 else 'gpkg',
+            gpkg_path=gpkg_path if source_mode == 1 else None,
+            analysis_config=analysis_config,
+        )
         estimator.run(feedback=feedback)
 
         return {'OUTPUT': output_folder}
@@ -173,30 +218,37 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
         """
         return 'gis_tools'
     
+    
     def shortHelpString(self):
-        return self.tr("""
+        return self.tr(r"""
             <b>Purpose of the Plugin</b>
-            The Vehicle and Passenger Flow Plugin estimates vehicle and passenger flows along road segments based on GTFS data.
-            It uses GTFS trips and OSM road geometry to calculate flows per time interval as configured in the PostGIS table
-            <code>transit.intervals</code> (for example, morning and afternoon peaks). Only rows marked as <code>active = TRUE</code>
-            are used when classifying flows.<br>
+            This tool estimates vehicle and passenger flows across transport segments using TfC standardized datasets.
+            It uses SDI or GeoPackage inputs derived from RouteLab data and processed schemas.<br>
+                       
+            <b>How to use the Plugin</b>
+            The plugin requires the following inputs:
+            1. SDI data source: Choose one of:
+            • PostGIS (QGIS connection): select an SDI PostGIS connection with the RL2SDI SDI schema
+            • GeoPackage (RouteLab SDI export): select a GeoPackage matching the TfC “RouteLab SDI GeoPackage Schema Specification”
+            2. Trip segments: segmentization threshold (meters) — (default: 300) Controls how finely trip geometries are split into segments prior to matching. Lower values create more (shorter) segments; higher values create fewer (longer) segments.
+            2. Output Folder Path: Destination folder for flow outputs<br>
 
-            <b>How to Use the Plugin</b>
-            1. Select the GTFS <code>.zip</code> file (from GIS2GTFS or any valid GTFS feed).
-            2. Choose the PostGIS SDI connection (standard schema from RL2SDI).
-            3. Ensure that <code>transit.intervals</code> is populated with the desired time bands
-            (columns <code>start_time</code>, <code>end_time</code>, <code>name</code>, <code>active</code>).
-            4. Specify an output folder for results.
-            5. Run the plugin to generate flow GeoPackages and diagnostic files.<br>
+            <b>Required SDI tables/layers</b>
+            The tool reads:
+            • <code>transit.intervals</code> (or <code>transit_intervals</code> in GeoPackage) – only rows with <code>active = TRUE/1</code> are used
+            • <code>raw.onboard_instances</code>
+            • <code>raw.stops</code> 
+            (or <code>raw_onboard_instances</code>, <code>raw_stops</code>). 
+            <code>raw.stops</code> must include <code>created_at</code>
 
             <b>Outputs</b>
-            • <code>vehicle_flow.gpkg</code>: vehicle flows, one layer per active interval from <code>transit.intervals</code>.
-            • <code>passenger_flow.gpkg</code>: passenger flows, one layer per active interval from <code>transit.intervals</code>.
+            • <code>vehicle_passenger_flow.gpkg</code>: vehicle and passenger flow layers.<br>
 
-            <b>More Information</b>
-            Detailed explanation of workflow, schema, and Fréchet distance matching is available in the User Guide:
+            <b>Documentation</b>
+            For workflow details and SDI schema assumptions, refer to the TfC Tools User Guide and the RouteLab SDI GeoPackage schema document.
             <a href="https://github.com/transportforcairo/tfc_tools/blob/main/tfc_tools_user_guide.pdf">TfC Tools User Guide</a>
-            """)
+                       """)
+
 
 
     def tr(self, string):

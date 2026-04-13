@@ -16,7 +16,9 @@ from .gtfs_modules.stop_times import generate as generate_stop_times
 
 
 def run_gtfs_pipeline(
+    sdi_mode,
     conn_name,
+    gpkg_path,
     data_raw_dir,
     data_dir,
     feed_name,
@@ -55,9 +57,11 @@ def run_gtfs_pipeline(
     print("🚀 Starting GTFS generation pipeline...")
 
     # --- Step 0: Download DB data
-    print("📥 Downloading DB data...", conn_name)
+    print("📥 Downloading SDI data...", conn_name if sdi_mode == 'postgres' else gpkg_path)
     download_db_data(
+        sdi_mode=sdi_mode,
         conn_name=conn_name,
+        gpkg_path=gpkg_path,
         output_dir=data_raw_dir
     )
     print("✅ Data downloaded")

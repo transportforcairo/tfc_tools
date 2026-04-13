@@ -1,4 +1,4 @@
-DROP MATERIALIZED VIEW IF EXISTS transit.trip_stops_sequence;
+DROP MATERIALIZED VIEW IF EXISTS transit.trip_stops_sequence CASCADE;
 CREATE MATERIALIZED VIEW transit.trip_stops_sequence AS(
 
 with recursive stop_distance_along_trip as 
@@ -20,12 +20,12 @@ with recursive stop_distance_along_trip as
 ),
 enriched_pairs as (
   select *, 
-  distance - lag(distance, 1) over (order by observer_trip_id, distance_frac) as distance_from_prev,
+  distance - lag(distance, 1) over (PARTITION BY observer_trip_id ORDER BY observer_trip_id, distance_frac) as distance_from_prev,
   row_number() OVER (PARTITION BY t_id ORDER BY distance_frac) AS stop_sequence
 
   from stop_distance_along_trip
 )
-select * from enriched_pairs where distance_from_prev >= 100 
+select * from enriched_pairs where distance_from_prev >= 100 OR distance_from_prev IS NULL
 
 );
 --------------------------------------
