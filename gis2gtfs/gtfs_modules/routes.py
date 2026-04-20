@@ -54,5 +54,5 @@ def generate(data_dir, data_raw_dir, continuous_dropoff_pickup=True):
     routes_df = routes_df[required_columns].rename(columns={"route_long": "route_long_name"})
 
     output_file = os.path.join(data_dir, "routes.txt")
-    routes_df.to_csv(output_file, index=False)
+    routes_df.to_csv(output_file, index=False, encoding='utf-8')
     print("✅ routes.txt written.")

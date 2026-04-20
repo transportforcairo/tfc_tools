@@ -43,9 +43,9 @@ def generate(data_dir, data_raw_dir, dwell_time_sec=15):
     print("🕓 Generating stop_times.txt...")
 
     # --- Load data
-    intervals = pd.read_csv(os.path.join(data_raw_dir, "intervals.csv"))
-    travel_times = pd.read_csv(os.path.join(data_raw_dir, "travel_times_trackpoints_filled_na.csv"))
-    stop_seq = pd.read_csv(os.path.join(data_raw_dir, "trip_stop_sequence.csv"))
+    intervals = pd.read_csv(os.path.join(data_raw_dir, "intervals.csv"), encoding='utf-8')
+    travel_times = pd.read_csv(os.path.join(data_raw_dir, "travel_times_trackpoints_filled_na.csv"), encoding='utf-8')
+    stop_seq = pd.read_csv(os.path.join(data_raw_dir, "trip_stop_sequence.csv"), encoding='utf-8')
     output_path = os.path.join(data_dir, "stop_times.txt")
 
     # ✅ Fix for schema mismatch: observer_trip_id → trip_id
@@ -55,6 +55,9 @@ def generate(data_dir, data_raw_dir, dwell_time_sec=15):
     # --- TEMP: Attach static interval_start from first row of intervals.csv (start_time field)
     # stop_seq["interval_start"] = str(intervals.loc[0, "start_time"])
     static_start_time = str(intervals.loc[0, "start_time"])
+    # Strip sub-second precision (e.g., '07:00:00.000000' from some Postgres time round-trips)
+    if "." in static_start_time:
+        static_start_time = static_start_time.split(".", 1)[0]
     # Normalize to HH:MM:SS
     if len(static_start_time.split(":")) == 2:
         static_start_time += ":00"
@@ -118,6 +121,6 @@ def generate(data_dir, data_raw_dir, dwell_time_sec=15):
     stop_times = merged[["trip_id", "stop_id", "stop_sequence", "arrival_time", "departure_time"]]
     stop_times = stop_times.sort_values(by=["trip_id", "stop_sequence"])
 
-    stop_times.to_csv(output_path, index=False)
+    stop_times.to_csv(output_path, index=False, encoding='utf-8')
 
     print("✅ stop_times.txt written.")

@@ -378,8 +378,7 @@ def get_avg_occupancy_per_segment_v3_sdi_timeproxy(
             )["departed_at"].ffill().bfill()
         )
         .assign(
-            survey_departed_at=lambda df: pd.to_datetime(df.survey_departed_at)
-            .dt.tz_convert("UTC")
+            survey_departed_at=lambda df: pd.to_datetime(df.survey_departed_at, utc=True)
             .dt.tz_localize(None)
         )
         .assign(

@@ -32,7 +32,12 @@ tracker=https://github.com/transportforcairo/tfc_tools/issues
 
 # Recommended items:
 hasProcessingProvider=yes
-changelog=Version 2.0:
+changelog=Version 2.1:
+    • New advanced stop-extraction parameters exposed in RL2GPKG and Refresh SDI
+    • New 6-tier OD travel-time estimation with fallback cascade, tagged by calculation method
+    • Big performance improvements in Refresh SDI
+    • Smart Postgres refresh path
+    Version 2.0:
     • New tools: RL2GPKG, SDI2GPKG, Revenue Estimator, Refresh SDI
     • GeoPackage input supported alongside PostgreSQL
     • Vehicle and Passenger Flow updates

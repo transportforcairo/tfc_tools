@@ -52,7 +52,7 @@ def download_db_data(sdi_mode, conn_name, gpkg_path, output_dir):
     elif "name_veh" in agency_df.columns:
         agency_df.rename(columns={"name_veh": "vehicle_name"}, inplace=True)
 
-    agency_df.to_csv(os.path.join(output_dir, "agency.csv"), index=False)
+    agency_df.to_csv(os.path.join(output_dir, "agency.csv"), index=False, encoding='utf-8')
 
     pickup_dropoff = agency_df[["agency_id", "has_serial"]].copy()
     pickup_dropoff["continuous_pickup"] = pickup_dropoff["has_serial"].apply(lambda x: 1 if x else 0)
@@ -78,21 +78,21 @@ def download_db_data(sdi_mode, conn_name, gpkg_path, output_dir):
     intervals_df = read_df(source, "transit.intervals")
     if "active" in intervals_df.columns:
         intervals_df = intervals_df[intervals_df["active"].isin([True, 1, "1", "t", "T", "true", "TRUE"])]
-    intervals_df.to_csv(os.path.join(output_dir, "intervals.csv"), index=False)
+    intervals_df.to_csv(os.path.join(output_dir, "intervals.csv"), index=False, encoding='utf-8')
 
     # -------------------- frequencies -------------------- #
     frequencies_df = read_df(source, "transit.trips_intervals")
     frequencies_df = frequencies_df[frequencies_df["interval_id"].isin(intervals_df["gid"])]
-    frequencies_df.to_csv(os.path.join(output_dir, "frequencies.csv"), index=False)
+    frequencies_df.to_csv(os.path.join(output_dir, "frequencies.csv"), index=False, encoding='utf-8')
 
     # -------------------- trip stop sequence -------------------- #
     tss_df = read_df(source, "transit.trip_stops_sequence")
     tss_df = tss_df.drop(columns=["gid"], errors="ignore")
-    tss_df.to_csv(os.path.join(output_dir, "trip_stop_sequence.csv"), index=False)
+    tss_df.to_csv(os.path.join(output_dir, "trip_stop_sequence.csv"), index=False, encoding='utf-8')
 
     # -------------------- travel time OD stats -------------------- #
     travel_df = read_df(source, "transit.od_stats")
     travel_df = travel_df[["o_id", "d_id", "interval_id", "interval_start", "duration", "vehicle_name"]]
-    travel_df.to_csv(os.path.join(output_dir, "travel_times_trackpoints.csv"), index=False)
+    travel_df.to_csv(os.path.join(output_dir, "travel_times_trackpoints.csv"), index=False, encoding='utf-8')
 
     print("✅ All data successfully downloaded and saved.")

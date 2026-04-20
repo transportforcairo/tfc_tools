@@ -45,5 +45,5 @@ def generate(data_dir, start_date, end_date, service_id):
         }
     ])
 
-    calendar_df.to_csv(output_file, index=False)
+    calendar_df.to_csv(output_file, index=False, encoding='utf-8')
     print("✅ calendar.txt written.")

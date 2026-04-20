@@ -1,4 +1,4 @@
-def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedback, fallback_headway_secs=None):
+def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedback, fallback_headway_secs=None, stop_params=None):
     
     import geopandas as gpd
     import pandas as pd
@@ -17,6 +17,41 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     def sql_path(filename):
         return os.path.join(os.path.dirname(__file__), filename)
     
+    # Resolve stop-extraction parameters (shared defaults live in tfc_tools_common.stop_params)
+    from ..tfc_tools_common.stop_params import StopParams
+    if stop_params is None:
+        stop_params = StopParams()
+    _stop_params_dict = stop_params.as_dict()
+    feedback.pushInfo(f"Stop-extraction parameters: {stop_params.describe()}")
+
+    # Translate the vehicle-pooling flag into the SQL placeholders used by od_stats.sql.
+    # When distinguishing, group by real vehicle_name and join on it too.
+    # When pooling, group by a constant so all vehicles share one average, and drop the
+    # vehicle_name condition from the join so vehicles with zero samples still receive a duration.
+    #
+    # The tiered-estimation version of od_stats.sql introduces additional joins with
+    # different alias pairs, each needing their own vehicle-equality clause:
+    #   - vehicle_join_condition_t1_s   : tier1_calculated (t1) ↔ od_segments (s)
+    #   - vehicle_join_condition_c_t1   : candidates (c)        ↔ tier1_calculated (t1)
+    # Tier 3 is grouped by either (o_id,d_id,vehicle_name) or (o_id,d_id), and the
+    # corresponding LEFT JOIN uses {tier3_group_keys} / {tier3_join_condition_wn_t3}.
+    _sql_subs = {k: v for k, v in _stop_params_dict.items() if k != "distinguish_speeds_by_vehicle"}
+    if stop_params.distinguish_speeds_by_vehicle:
+        _sql_subs["vehicle_group_expr"]             = "obs.vehicle_name"
+        _sql_subs["vehicle_join_condition"]         = "AND od_segments.vehicle_name = avg_durations.vehicle_name"
+        _sql_subs["vehicle_join_condition_t1_s"]    = "AND t1.vehicle_name = s.vehicle_name"
+        _sql_subs["vehicle_join_condition_c_t1"]    = "AND c.vehicle_name = t1.vehicle_name"
+        _sql_subs["tier3_group_keys"]               = "o_id, d_id, vehicle_name"
+        _sql_subs["tier3_join_condition_b_t3"]      = ("b.o_id = t3.o_id AND b.d_id = t3.d_id "
+                                                      "AND b.vehicle_name = t3.vehicle_name")
+    else:
+        _sql_subs["vehicle_group_expr"]             = "'_pooled_'::text"
+        _sql_subs["vehicle_join_condition"]         = ""
+        _sql_subs["vehicle_join_condition_t1_s"]    = ""
+        _sql_subs["vehicle_join_condition_c_t1"]    = ""
+        _sql_subs["tier3_group_keys"]               = "o_id, d_id"
+        _sql_subs["tier3_join_condition_b_t3"]      = "b.o_id = t3.o_id AND b.d_id = t3.d_id"
+
     OBSERVER_PROJECT_ID = observer_project_id #MODIFIED THIS
 
     
@@ -722,15 +757,15 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     # TODO: LCTF continue from here. Waiting on stops digitization to be done.
     # UPDATE: Stops digitization automated by running this sql below
     with open(sql_path("create_processed_stops.sql")) as f:
-        create_processed_stops_sql_query = f.read()
+        create_processed_stops_sql_query = f.read().format(**_sql_subs)
         run_ddl_sql(create_processed_stops_sql_query, city_db_con)
 
 
     with open(sql_path("trips_stops_sequence.sql")) as f:
-            trips_stops_sequence_sql_query = f.read()
+            trips_stops_sequence_sql_query = f.read().format(**_sql_subs)
             run_ddl_sql(trips_stops_sequence_sql_query, city_db_con) # we used run_ddl_sql here bec. trips_stops_sequence.sql has CREATE in it
     with open(sql_path("od_stats.sql")) as f:
-        od_stats_sql = f.read()
+        od_stats_sql = f.read().format(**_sql_subs)
         # city_db_con.execute(text(od_stats_sql))
         run_ddl_sql(od_stats_sql, city_db_con)
     feedback.pushInfo("od_stats is finished")

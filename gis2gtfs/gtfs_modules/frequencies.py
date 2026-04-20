@@ -34,11 +34,11 @@ def generate(data_dir, data_raw_dir):
     output_file = os.path.join(data_dir, "frequencies.txt")
 
     # Load inputs
-    freq_df = pd.read_csv(frequencies_path)
+    freq_df = pd.read_csv(frequencies_path, encoding='utf-8')
     freq_df.rename(columns={"trip_id": "trip_id_freq"}, inplace=True) # rename field to avoid conflict with trips.geojson field of trip_id
     trips_gdf = gpd.read_file(trips_path)[["gid","observer_id"]].copy() # copy the field "gid" and "observer_id" then rename it as "trip_id"
     trips_gdf["trip_id"] = trips_gdf["observer_id"].astype(str)  # same as R: stringr::str_c(gid)
-    intervals_df = pd.read_csv(intervals_path)
+    intervals_df = pd.read_csv(intervals_path, encoding='utf-8')
 
     # Drop geometries for joining
     trips_df = trips_gdf.drop(columns=["geometry","observer_id"], errors="ignore")
@@ -51,6 +51,23 @@ def generate(data_dir, data_raw_dir):
 
     # Select
     freq_df = freq_df[["trip_id", "start_time", "end_time", "headway_secs"]]
+
+    # GTFS times must be exactly HH:MM:SS (no microseconds, no timezone suffix).
+    # Some sources (e.g., GPKG exports that round-trip Postgres `time` through
+    # datetime.time) store '07:00:00.000000' — strip the fractional part.
+    def _to_gtfs_time(v):
+        if pd.isna(v):
+            return v
+        s = str(v).strip()
+        # Take only up to the first 8 chars (HH:MM:SS); if input was 'HH:MM', pad with :00.
+        if "." in s:
+            s = s.split(".", 1)[0]
+        if len(s) == 5 and s.count(":") == 1:  # 'HH:MM'
+            s = s + ":00"
+        return s
+
+    freq_df["start_time"] = freq_df["start_time"].apply(_to_gtfs_time)
+    freq_df["end_time"]   = freq_df["end_time"].apply(_to_gtfs_time)
 
     # # 🚨 TEMP PATCH: Drop rows with missing headway_secs temporarily (avoid error during conversion)
     # if freq_df["headway_secs"].isnull().any():
@@ -66,5 +83,5 @@ def generate(data_dir, data_raw_dir):
     freq_df["headway_secs"] = freq_df["headway_secs"].astype(int) # Write headway_secs as integer (no decimals)
     
     # Save GTFS output
-    freq_df.to_csv(output_file, index=False)
+    freq_df.to_csv(output_file, index=False, encoding='utf-8')
     print("✅ frequencies.txt written.")

@@ -14,7 +14,7 @@ with recursive stop_distance_along_trip as
     v.name::text AS vehicle_name
   FROM   
     	transit.stops s
-    	join transit.trips t on st_dwithin(t.geom::geography, s.geom::geography, 1::real)
+    	join transit.trips t on st_dwithin(t.geom::geography, s.geom::geography, {stop_trip_buffer_m}::real)
 	    LEFT JOIN transit.agencies t1 ON t.agency_id = t1.gid
 	    LEFT JOIN transit.vehicles v ON t1.vehicle_id = v.gid
 ),
@@ -25,7 +25,7 @@ enriched_pairs as (
 
   from stop_distance_along_trip
 )
-select * from enriched_pairs where distance_from_prev >= 100 OR distance_from_prev IS NULL
+select * from enriched_pairs where distance_from_prev >= {min_stop_spacing_m} OR distance_from_prev IS NULL
 
 );
 --------------------------------------

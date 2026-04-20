@@ -25,7 +25,7 @@ def generate(data_dir, data_raw_dir):
     output_file = os.path.join(data_dir, "agency.txt")
 
     print("📥 Reading agency.csv...")
-    agency_df = pd.read_csv(input_file)
+    agency_df = pd.read_csv(input_file, encoding='utf-8')
 
     # # 🚨 TEMP PATCH: Fill missing agency_name
     # # THIS PART IS FOR TESTING PURPOSES 
@@ -38,6 +38,6 @@ def generate(data_dir, data_raw_dir):
 
     print("📤 Writing agency.txt...")
     agency_df = agency_df[["agency_id", "agency_name", "agency_url", "agency_timezone"]]
-    agency_df.to_csv(output_file, index=False)
+    agency_df.to_csv(output_file, index=False, encoding='utf-8')
 
     print("✅ agency.txt written.")

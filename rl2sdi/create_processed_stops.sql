@@ -23,7 +23,7 @@ WITH pts AS (
 clusters AS (
   SELECT
     *,
-    ST_ClusterDBSCAN(g3857, eps := 150, minpoints := 3) OVER () AS cluster_id
+    ST_ClusterDBSCAN(g3857, eps := {dbscan_eps_m}, minpoints := {dbscan_minpoints}) OVER () AS cluster_id
   FROM pts
 ),
 valid AS (
@@ -71,8 +71,8 @@ CREATE MATERIALIZED VIEW transit.stops_auto AS
 WITH
 const AS (
   SELECT 250::double precision AS MIN_SPACING_M,
-         30::double precision  AS SNAP_MAX_M,
-         75::double precision  AS TERMINAL_M
+         {snap_max_m}::double precision  AS SNAP_MAX_M,
+         {terminal_m}::double precision  AS TERMINAL_M
 ),
 c AS (
   SELECT sc.cluster_id, sc.mode_name, sc.n_points, sc.centroid,
@@ -81,7 +81,7 @@ c AS (
 ),
 -- replace your spaced AS (...) with this block
 spaced AS (
-  WITH params AS (SELECT 120.0::double precision AS cell_m),  -- tweak spacing here
+  WITH params AS (SELECT {cell_m}::double precision AS cell_m),  -- grid spacing (tuneable from TfC Tools)
   cells AS (
     SELECT
       c.*,
@@ -169,8 +169,8 @@ SELECT
   stop_type,
   cluster_id                                 AS cluster_id,
   dir_bin                                    AS "double",
-  ST_X(geom)                                 AS stop_lon,
-  ST_Y(geom)                                 AS stop_lat,
+  -- stop_lon / stop_lat columns intentionally omitted: the point geometry is
+  -- the single source of truth. Derive coordinates from geom at read time.
   geom
 FROM final;
 
@@ -189,14 +189,16 @@ CREATE TABLE transit.stops (
   stop_desc     TEXT,
   location_type INT,
   "double"      INT,
-  stop_lon      DOUBLE PRECISION,
-  stop_lat      DOUBLE PRECISION,
+  -- stop_lon / stop_lat columns intentionally omitted: the point geometry is
+  -- the single source of truth. Any coordinate needed downstream must be
+  -- derived from geom (ST_X, ST_Y) at read time so that visual edits to the
+  -- point in QGIS cannot silently desync from a stored scalar.
   geom          geometry(Point, 4326)
 );
 
 CREATE UNIQUE INDEX transit_stops_stop_id_uidx ON transit.stops (stop_id);
 CREATE INDEX transit_stops_geom_gist ON transit.stops USING GIST (geom);
 
-INSERT INTO transit.stops (stop_name, stop_desc, location_type, "double", stop_lon, stop_lat, geom)
-SELECT stop_name, stop_desc, location_type, "double", stop_lon, stop_lat, geom
+INSERT INTO transit.stops (stop_name, stop_desc, location_type, "double", geom)
+SELECT stop_name, stop_desc, location_type, "double", geom
 FROM transit.stops_auto;

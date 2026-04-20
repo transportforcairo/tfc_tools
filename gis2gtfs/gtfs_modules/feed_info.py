@@ -40,5 +40,5 @@ def generate(data_dir, feed_name, feed_start_date, feed_end_date, feed_version=N
         "feed_lang": feed_lang
     }])
 
-    feed_info_df.to_csv(output_file, index=False)
+    feed_info_df.to_csv(output_file, index=False, encoding='utf-8')
     print("✅ feed_info.txt written.")

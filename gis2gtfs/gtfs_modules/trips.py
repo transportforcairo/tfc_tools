@@ -58,10 +58,10 @@ def generate(data_dir, data_raw_dir):
 
     # Save to GTFS output
     trips_txt = os.path.join(data_dir, "trips.txt")
-    trips_df.to_csv(trips_txt, index=False)
+    trips_df.to_csv(trips_txt, index=False, encoding='utf-8')
 
     # Save a CSV for internal use (optional)
     trips_csv = os.path.join(data_raw_dir, "trips_with_intervals.csv")
-    trips_df.to_csv(trips_csv, index=False)
+    trips_df.to_csv(trips_csv, index=False, encoding='utf-8')
 
     print("✅ trips.txt and trips_with_intervals.csv written.")

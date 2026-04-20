@@ -105,14 +105,7 @@ def gdf_to_qgis_layer(gdf, layer_name):
     for col in gdf.columns:
         if col == gdf.geometry.name:
             continue
-        dtype = gdf[col].dtype
-
-        if np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
-            qtype = QVariant.Int
-        elif np.issubdtype(dtype, np.floating):
-            qtype = QVariant.Double
-        else:
-            qtype = QVariant.String
+        qtype = _qvariant_type_for_series(gdf[col])
 
         fields.append(QgsField(str(col), qtype))
     pr.addAttributes(fields)

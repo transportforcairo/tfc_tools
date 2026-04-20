@@ -31,6 +31,10 @@ __copyright__ = '(C) 2025 by Transport for Cairo'
 __revision__ = '$Format:%H$'
 
 from ..tfc_tools_common import ensure_deps
+from ..tfc_tools_common.stop_params import (
+    add_stop_params_to_algorithm,
+    read_stop_params_from_algorithm,
+)
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (QgsProcessing,
@@ -128,6 +132,11 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
             pass
         self.addParameter(p)
 
+        # Stop-extraction parameters (all advanced, all with sensible defaults).
+        # Shared with the "Refresh SDI Derived Layers" tool so that editing
+        # stops/trips in GIS and refreshing reproduces the same pipeline.
+        add_stop_params_to_algorithm(self)
+
     def processAlgorithm(self, parameters, context, feedback):
         """
         Here is where the processing itself takes place.
@@ -149,6 +158,9 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
         # QGIS returns 0 when unset for some builds; treat <=0 as unset
         if fallback_headway is not None and fallback_headway <= 0:
             fallback_headway = None
+
+        # Read stop-extraction parameters (defaults preserved if user didn't touch them).
+        stop_params = read_stop_params_from_algorithm(self, parameters, context)
 
         feedback.pushInfo(f"Using Observer connection: {observer_conn_name}")
         feedback.pushInfo(f"Using SDI connection: {sdi_conn_name}")
@@ -184,7 +196,7 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
         }
 
         # Call the core logic function run_migration(), with the cleaned-up inputs
-        run_migration(observer_db_params, sdi_db_params, project_id, feedback, fallback_headway)
+        run_migration(observer_db_params, sdi_db_params, project_id, feedback, fallback_headway, stop_params=stop_params)
         return {'RESULT': 'Migration completed successfully'}
 
 

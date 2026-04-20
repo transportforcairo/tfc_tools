@@ -63,6 +63,6 @@ def generate(data_dir, data_raw_dir):
 
     # Create final DataFrame and save
     shapes_df = pd.DataFrame(shape_records)
-    shapes_df.to_csv(output_file, index=False)
+    shapes_df.to_csv(output_file, index=False, encoding='utf-8')
 
     print("✅ shapes.txt written.")

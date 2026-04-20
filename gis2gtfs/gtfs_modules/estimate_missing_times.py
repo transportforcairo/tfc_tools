@@ -64,15 +64,15 @@ def run_estimate_missing_times(input_csv, output_csv, vehicle=0, od_pairs_buffer
     Main wrapper function for running the missing time estimation
     """
     print("📥 Loading travel time data...")
-    travel_times = pd.read_csv(input_csv)
+    travel_times = pd.read_csv(input_csv, encoding='utf-8')
 
     od_pairs_buffer = None
     if od_pairs_buffer_csv:
-        od_pairs_buffer = pd.read_csv(od_pairs_buffer_csv)
+        od_pairs_buffer = pd.read_csv(od_pairs_buffer_csv, encoding='utf-8')
 
     print("🧠 Estimating missing values...")
     travel_times_filled = estimate_missing_values(travel_times, vehicle=vehicle, od_pairs_buffer=od_pairs_buffer)
 
     print("💾 Saving filled travel times...")
-    travel_times_filled.to_csv(output_csv, index=False)
+    travel_times_filled.to_csv(output_csv, index=False, encoding='utf-8')
     print("✅ Done: saved to", output_csv)
