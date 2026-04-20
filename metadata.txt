@@ -6,7 +6,7 @@
 name=TfC Tools
 qgisMinimumVersion=3.40
 description=A suite of tools by Transport for Cairo (TfC)
-version=2.0
+version=2.1
 author=Transport for Cairo
 email=info@transportforcairo.com
 
