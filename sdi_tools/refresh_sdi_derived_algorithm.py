@@ -590,10 +590,25 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             # int/text mismatches between exports.
             if "agency_id" in df.columns and "agency_id" in ag.columns:
                 keep = [c for c in ["agency_id", "common_name", "vehicle_id"] if c in ag.columns]
-                ag = ag[keep].copy()
-                ag["agency_id"] = ag["agency_id"].astype(str)
+                ag_code = ag[keep].copy()
+                ag_code["agency_id"] = ag_code["agency_id"].astype(str)
                 df["agency_id"] = df["agency_id"].astype(str)
-                df = df.merge(ag, on="agency_id", how="left")
+                merged = df.merge(ag_code, on="agency_id", how="left")
+                # Some exporters write transit_trips.agency_id as the agency
+                # *gid* (integer) rather than the agency code. In that case the
+                # code-based merge above matches nothing and vehicle_id stays
+                # NaN for every row. Detect this and retry on gid.
+                needs_gid_fallback = (
+                    "vehicle_id" in merged.columns
+                    and merged["vehicle_id"].isna().all()
+                    and "gid" in agencies.columns
+                )
+                if needs_gid_fallback:
+                    keep_gid = [c for c in ["gid", "common_name", "vehicle_id"] if c in agencies.columns]
+                    ag_gid = agencies[keep_gid].copy().rename(columns={"gid": "agency_gid"})
+                    ag_gid["agency_gid"] = ag_gid["agency_gid"].astype(str)
+                    merged = df.merge(ag_gid, left_on="agency_id", right_on="agency_gid", how="left")
+                df = merged
             else:
                 keep = [c for c in ["gid", "agency_id", "common_name", "vehicle_id"] if c in ag.columns]
                 ag = ag[keep].rename(columns={"gid": "agency_gid"})
@@ -660,7 +675,22 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
                 # Coerce both sides to str to sidestep int/text merge errors.
                 ag["agency_id"] = ag["agency_id"].astype(str)
                 trips_meta["agency_id"] = trips_meta["agency_id"].astype(str)
-                trips_meta = trips_meta.merge(ag, on="agency_id", how="left")
+                merged = trips_meta.merge(ag, on="agency_id", how="left")
+                # Some exporters write transit_trips.agency_id as the agency gid
+                # (integer) rather than the text code. In that case the code
+                # merge matches nothing and vehicle_id stays NaN everywhere.
+                # Retry on agency gid.
+                needs_gid_fallback = (
+                    "vehicle_id" in merged.columns
+                    and merged["vehicle_id"].isna().all()
+                    and "gid" in agencies.columns
+                )
+                if needs_gid_fallback:
+                    keep_gid = [c for c in ["gid", "vehicle_id"] if c in agencies.columns]
+                    ag_gid = agencies[keep_gid].copy().rename(columns={"gid": "agency_gid"})
+                    ag_gid["agency_gid"] = ag_gid["agency_gid"].astype(str)
+                    merged = trips_meta.merge(ag_gid, left_on="agency_id", right_on="agency_gid", how="left")
+                trips_meta = merged
             else:
                 ag = agencies[[c for c in ["gid", "vehicle_id"] if c in agencies.columns]].rename(
                     columns={"gid": "agency_gid"}

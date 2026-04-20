@@ -33,16 +33,21 @@ def download_db_data(sdi_mode, conn_name, gpkg_path, output_dir):
     agency_df = read_df(source, "transit.agencies")
     vehicles_df = read_df(source, "transit.vehicles")
 
-    # Robust join on vehicles.gid (not DataFrame index)
+    # Robust join on vehicles.gid (not DataFrame index).
+    # IMPORTANT: we preserve agency_df['gid'] (the agency gid) in the output
+    # CSV so downstream modules (e.g. routes.py) can remap agency_id values
+    # that were written as the gid instead of the text code. We do that by
+    # renaming vehicles.gid -> gid_veh BEFORE the merge, so the agency gid
+    # column is never dropped.
     if "gid" in vehicles_df.columns:
+        veh_cols = [c for c in ["gid", "name", "passenger_capacity"] if c in vehicles_df.columns]
+        veh = vehicles_df[veh_cols].rename(columns={"gid": "gid_veh"})
         agency_df = agency_df.merge(
-            vehicles_df[[c for c in ["gid", "name", "passenger_capacity"] if c in vehicles_df.columns]],
+            veh,
             left_on="vehicle_id",
-            right_on="gid",
+            right_on="gid_veh",
             how="left",
-            suffixes=("", "_veh"),
         )
-        agency_df.drop(columns=["gid"], inplace=True, errors="ignore")
     else:
         # fallback (should not happen in TfC schema)
         agency_df = agency_df.merge(vehicles_df, left_on="vehicle_id", right_index=True, how="left")
