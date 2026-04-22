@@ -405,7 +405,30 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             gdf = gdf.set_crs("EPSG:4326")
         return gdf
 
+    @staticmethod
+    def _safe_identifier(name: str) -> str:
+        """Validate a SQLite identifier for safe inline use in a query.
+
+        SQLite does not accept bound parameters for table or column names, so
+        when we select from a user-provided layer we must interpolate the name
+        into the SQL text. To prevent any form of SQL injection we reject any
+        name that is not a simple identifier (letters, digits, underscores).
+        Callers should only pass hard-coded names from elsewhere in this
+        codebase; this guard is defensive.
+        """
+        import re
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            # Intentionally not an f-string: Bandit's B608 pattern matcher
+            # flags f-strings containing 'SELECT' / 'FROM' / etc. even when
+            # they're inside a ValueError message, because it cannot tell the
+            # difference. Keeping this as a plain constant keeps the scanner
+            # quiet without concatenating the untrusted identifier into the
+            # message at all.
+            raise ValueError("Unsafe SQL identifier rejected")
+        return name
+
     def _load_required_df(self, source: SDISource, layers: set[str], layer: str) -> pd.DataFrame:
+        safe_layer = self._safe_identifier(layer)
         with sqlite3.connect(source.gpkg_path) as conn:
             exists = pd.read_sql_query(
                 """
@@ -418,7 +441,9 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             )["n"].iloc[0]
             if not exists:
                 raise FileNotFoundError(layer)
-        return pd.read_sql_query(f'SELECT * FROM "{layer}"', conn)
+        # safe_layer has been validated to match [A-Za-z_][A-Za-z0-9_]* above,
+        # so the only possible values are plain SQL identifiers.
+        return pd.read_sql_query(f'SELECT * FROM "{safe_layer}"', conn)  # nosec B608 — identifier validated above
 
     def _warn_skip(self, feedback, label: str, reason: str):
         feedback.reportError(f"Warning: {label} was not refreshed: {reason}")
@@ -583,6 +608,32 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         terminals = self._load_required_gdf(source, layers, "transit_terminals") if "transit_terminals" in layers else gpd.GeoDataFrame()
 
         df = trips.copy()
+
+        # If an existing transit_trips_view is in the GeoPackage (from rl2gpkg),
+        # its vehicle_name / passenger_capacity / origin / destination columns
+        # are the authoritative values (they were joined at export time using
+        # proper PostgreSQL joins). Pull them into our working df keyed on gid
+        # so the downstream agencies→vehicles chain merge only fills gaps,
+        # never overwrites correct values with NULLs from broken FK links.
+        if "transit_trips_view" in layers and "gid" in df.columns:
+            try:
+                existing_view = self._load_existing_gdf(source.gpkg_path, "transit_trips_view")
+                enrich_cols = [c for c in ["vehicle_name", "passenger_capacity", "origin", "destination"]
+                               if c in existing_view.columns and c not in df.columns]
+                if enrich_cols and "gid" in existing_view.columns:
+                    ev = existing_view[["gid"] + enrich_cols].copy()
+                    # Coerce gid on both sides to str to tolerate type mismatches.
+                    ev["gid"] = ev["gid"].astype(str)
+                    df["gid"] = df["gid"].astype(str)
+                    df = df.merge(ev, on="gid", how="left")
+                    if feedback:
+                        feedback.pushInfo(
+                            f"Preserved columns from existing transit_trips_view: {enrich_cols}"
+                        )
+            except Exception as e:
+                if feedback:
+                    feedback.pushInfo(f"Could not read existing transit_trips_view for enrichment: {e}")
+
         if not agencies.empty:
             ag = agencies.copy()
             # Prefer joining on agency_id (text code) when both sides have it;
@@ -590,25 +641,10 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             # int/text mismatches between exports.
             if "agency_id" in df.columns and "agency_id" in ag.columns:
                 keep = [c for c in ["agency_id", "common_name", "vehicle_id"] if c in ag.columns]
-                ag_code = ag[keep].copy()
-                ag_code["agency_id"] = ag_code["agency_id"].astype(str)
+                ag = ag[keep].copy()
+                ag["agency_id"] = ag["agency_id"].astype(str)
                 df["agency_id"] = df["agency_id"].astype(str)
-                merged = df.merge(ag_code, on="agency_id", how="left")
-                # Some exporters write transit_trips.agency_id as the agency
-                # *gid* (integer) rather than the agency code. In that case the
-                # code-based merge above matches nothing and vehicle_id stays
-                # NaN for every row. Detect this and retry on gid.
-                needs_gid_fallback = (
-                    "vehicle_id" in merged.columns
-                    and merged["vehicle_id"].isna().all()
-                    and "gid" in agencies.columns
-                )
-                if needs_gid_fallback:
-                    keep_gid = [c for c in ["gid", "common_name", "vehicle_id"] if c in agencies.columns]
-                    ag_gid = agencies[keep_gid].copy().rename(columns={"gid": "agency_gid"})
-                    ag_gid["agency_gid"] = ag_gid["agency_gid"].astype(str)
-                    merged = df.merge(ag_gid, left_on="agency_id", right_on="agency_gid", how="left")
-                df = merged
+                df = df.merge(ag, on="agency_id", how="left")
             else:
                 keep = [c for c in ["gid", "agency_id", "common_name", "vehicle_id"] if c in ag.columns]
                 ag = ag[keep].rename(columns={"gid": "agency_gid"})
@@ -624,11 +660,39 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             if "vehicle_gid" in veh.columns:
                 veh["vehicle_gid"] = veh["vehicle_gid"].astype(str)
             df["vehicle_id"] = df["vehicle_id"].astype(str)
+            # Preserve any vehicle_name / passenger_capacity already present on
+            # trips (rl2gpkg populates them directly) so the chained merge below
+            # can't silently overwrite authoritative values with NULLs when
+            # agency_id / vehicle_id mappings are incomplete. After the merge we
+            # combine: original wins where populated, merged fills the gaps.
+            _orig_vn = df["vehicle_name"] if "vehicle_name" in df.columns else None
+            _orig_pc = df["passenger_capacity"] if "passenger_capacity" in df.columns else None
+            if _orig_vn is not None:
+                df = df.drop(columns=["vehicle_name"])
+            if _orig_pc is not None:
+                df = df.drop(columns=["passenger_capacity"])
             df = df.merge(veh, left_on="vehicle_id", right_on="vehicle_gid", how="left")
+            if _orig_vn is not None:
+                df["vehicle_name"] = _orig_vn.where(_orig_vn.notna(), df.get("vehicle_name"))
+            if _orig_pc is not None:
+                df["passenger_capacity"] = _orig_pc.where(_orig_pc.notna(), df.get("passenger_capacity"))
         if not terminals.empty:
             tt = terminals[[c for c in ["gid", "name"] if c in terminals.columns]].copy()
+            # Same preservation pattern as vehicle_name above: if trips already
+            # has origin / destination from the enriched transit_trips_view, keep
+            # the originals and let the terminal merge only fill gaps.
+            _orig_origin = df["origin"] if "origin" in df.columns else None
+            _orig_destination = df["destination"] if "destination" in df.columns else None
+            if _orig_origin is not None:
+                df = df.drop(columns=["origin"])
+            if _orig_destination is not None:
+                df = df.drop(columns=["destination"])
             df = df.merge(tt.rename(columns={"gid": "o_id", "name": "origin"}), on="o_id", how="left")
             df = df.merge(tt.rename(columns={"gid": "d_id", "name": "destination"}), on="d_id", how="left")
+            if _orig_origin is not None:
+                df["origin"] = _orig_origin.where(_orig_origin.notna(), df.get("origin"))
+            if _orig_destination is not None:
+                df["destination"] = _orig_destination.where(_orig_destination.notna(), df.get("destination"))
 
         agency_common = df["common_name"] if "common_name" in df.columns else pd.Series([None] * len(df), index=df.index)
         agency_serial = df["agency_serial"] if "agency_serial" in df.columns else pd.Series([None] * len(df), index=df.index)
@@ -649,7 +713,13 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         return gpd.GeoDataFrame(out, geometry="geometry", crs=trips.crs)
 
     def _build_trip_stops_sequence(self, source: SDISource, layers: set[str], stop_params: StopParams, feedback) -> pd.DataFrame:
-        trips_layer = "transit_trips" if "transit_trips" in layers else "transit_trips_view"
+        # Prefer transit_trips_view: it carries vehicle_name, passenger_capacity,
+        # origin/destination etc. directly from the export join, so we don't have
+        # to reconstruct them from the (sometimes incomplete) agencies→vehicles
+        # chain. transit_trips is a bare base table without those columns, so
+        # falling back to it loses data. _refresh_gpkg runs _try_build_trips_view
+        # immediately before this, so the view is guaranteed fresh.
+        trips_layer = "transit_trips_view" if "transit_trips_view" in layers else "transit_trips"
         trips = self._load_required_gdf(source, layers, trips_layer)
         stops = self._load_required_gdf(source, layers, "transit_stops")
         agencies = self._load_required_df(source, layers, "transit_agencies") if "transit_agencies" in layers else pd.DataFrame()
@@ -675,22 +745,7 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
                 # Coerce both sides to str to sidestep int/text merge errors.
                 ag["agency_id"] = ag["agency_id"].astype(str)
                 trips_meta["agency_id"] = trips_meta["agency_id"].astype(str)
-                merged = trips_meta.merge(ag, on="agency_id", how="left")
-                # Some exporters write transit_trips.agency_id as the agency gid
-                # (integer) rather than the text code. In that case the code
-                # merge matches nothing and vehicle_id stays NaN everywhere.
-                # Retry on agency gid.
-                needs_gid_fallback = (
-                    "vehicle_id" in merged.columns
-                    and merged["vehicle_id"].isna().all()
-                    and "gid" in agencies.columns
-                )
-                if needs_gid_fallback:
-                    keep_gid = [c for c in ["gid", "vehicle_id"] if c in agencies.columns]
-                    ag_gid = agencies[keep_gid].copy().rename(columns={"gid": "agency_gid"})
-                    ag_gid["agency_gid"] = ag_gid["agency_gid"].astype(str)
-                    merged = trips_meta.merge(ag_gid, left_on="agency_id", right_on="agency_gid", how="left")
-                trips_meta = merged
+                trips_meta = trips_meta.merge(ag, on="agency_id", how="left")
             else:
                 ag = agencies[[c for c in ["gid", "vehicle_id"] if c in agencies.columns]].rename(
                     columns={"gid": "agency_gid"}
@@ -748,9 +803,27 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             observer_trip_id = trip_obs_arr[trip_pos]
             if hasattr(observer_trip_id, "item"):
                 observer_trip_id = observer_trip_id.item()
-            vehicle_name = meta_by_trip.get(t_gid, {}).get("vehicle_name") if t_gid in meta_by_trip else (
-                trips.iloc[trip_pos].get("vehicle_name") if "vehicle_name" in trips.columns else None
-            )
+            # vehicle_name resolution order:
+            #   1. If trips already has a populated vehicle_name column (rl2gpkg
+            #      writes one directly on transit_trips_view), trust that. It is
+            #      authoritative because the export SQL joined it from vehicles
+            #      at the source.
+            #   2. Otherwise, use the chained agencies→vehicles lookup via
+            #      meta_by_trip. This is only needed for legacy GPKGs that don't
+            #      carry the direct column.
+            # Previously this preferred (2) over (1), which caused vehicle_name
+            # to silently become NULL whenever the agency→vehicle chain broke
+            # (e.g. unmapped agency_id, missing vehicle_id), even though the
+            # correct value was sitting right there in trips.vehicle_name.
+            direct_vn = None
+            if "vehicle_name" in trips.columns:
+                direct_vn = trips.iloc[trip_pos].get("vehicle_name")
+                if pd.isna(direct_vn):
+                    direct_vn = None
+            if direct_vn is not None:
+                vehicle_name = direct_vn
+            else:
+                vehicle_name = meta_by_trip.get(t_gid, {}).get("vehicle_name") if t_gid in meta_by_trip else None
 
             cand_idxs = cand_by_trip.get(trip_pos, [])
             if not cand_idxs:
@@ -963,7 +1036,38 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         od_ts = od_ts[od_ts["time_diff"] > 0].copy()
 
         if od_ts.empty:
-            raise ValueError("No positive OD travel times could be computed from raw_onboard_instances/raw_trackpoints.")
+            # The pipeline through this point was:
+            #   raw_trackpoints → track3857 (filtered to valid instances)
+            #                   → tp_near (trackpoints within N m of any stop)
+            #                   → o_lookup / d_lookup (joined to od_segments' o_id / d_id)
+            #                   → o_ts / d_ts (aggregated per instance)
+            #                   → od_ts (inner join on instance_id + vehicle_name)
+            #                   → filtered to time_diff > 0
+            # If od_ts ends up empty, one of those stages zeroed out. Point to
+            # the right one so the real cause is obvious in the feedback log.
+            diag = [
+                "No positive OD travel times could be computed from raw_onboard_instances/raw_trackpoints.",
+                "Diagnostics:",
+                f"  valid finished onboard instances (raw_onboard['id']): {len(valid_ids)}",
+                f"  trackpoints after instance+timestamp filter:         {len(track3857)}",
+                f"  trackpoint→stop matches (tp_near):                   {len(tp_near_df)}",
+                f"  o_lookup rows (tp_near ⨝ od_segments.o_id):          {len(o_lookup)}",
+                f"  d_lookup rows (tp_near ⨝ od_segments.d_id):          {len(d_lookup)}",
+                f"  o_ts rows (per-instance origin aggregates):          {len(o_ts)}",
+                f"  d_ts rows (per-instance destination aggregates):     {len(d_ts)}",
+                f"  od_ts rows before time_diff filter:                  "
+                f"{len(o_ts.merge(d_ts, on=['instance_id', 'vehicle_name'], how='inner'))}",
+                "Likely causes depending on where the counts drop to zero:",
+                "  - 0 after instance filter → raw_onboard['id'] doesn't match raw_trackpoints['onboard_instance_id']. "
+                "Check column names in your raw_onboard_instances layer.",
+                "  - 0 in tp_near → trackpoint_buffer_m is too small, or stops/trackpoints are in different CRS.",
+                "  - 0 in o_lookup or d_lookup → stop_ids in od_segments don't match gids in transit_stops.",
+                "  - 0 after time_diff filter → every instance visited stops in reverse time order (data issue).",
+            ]
+            if feedback:
+                for line in diag:
+                    feedback.reportError(line)
+            raise ValueError(diag[0])
 
         # ---- tolerant interval parsing ----
         intervals = intervals.copy()
@@ -1078,12 +1182,22 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         # vehicle x geometry), and durations from tier1 are merged without a
         # vehicle_name join key so that every vehicle category gets the pooled
         # per-(o_id,d_id,interval) duration.
-        intervals_for_merge = intervals[["gid", "start_time"]].copy()
-        intervals_for_merge = intervals_for_merge.rename(columns={"gid": "interval_id"})
+        intervals_for_merge = intervals[
+            [c for c in ["gid", "name", "start_time"] if c in intervals.columns]
+        ].copy()
+        intervals_for_merge = intervals_for_merge.rename(
+            columns={"gid": "interval_id", "name": "interval_name"}
+        )
         intervals_for_merge["interval_start"] = intervals_for_merge["start_time"].apply(
             lambda t: t.strftime("%H:%M:%S") if t is not None else None
         )
-        intervals_for_merge = intervals_for_merge[["interval_id", "interval_start"]]
+        # Keep interval_name alongside id/start so the downstream cartesian product
+        # carries it through to the final od_stats columns. This matches the schema
+        # emitted by the Postgres materialized view and by rl2gpkg, so consumers
+        # (veh-pas-flow, gis2gtfs) see the same columns regardless of producer.
+        keep_intervals = [c for c in ["interval_id", "interval_name", "interval_start"]
+                          if c in intervals_for_merge.columns]
+        intervals_for_merge = intervals_for_merge[keep_intervals]
 
         # Cartesian product of od_segments × intervals — each row represents
         # an (o_id, d_id, vehicle_name, geometry, interval_id) combination
@@ -1154,6 +1268,7 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             "o_id",
             "d_id",
             "interval_id",
+            "interval_name",
             "interval_start",
             "vehicle_name",
             "dist",
@@ -1163,6 +1278,11 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             "n_samples",
             "geometry",
         ]
+        # Defensive: if intervals didn't have a `name` column (unexpected but
+        # possible with upstream schema drift), fall back to interval_id as the
+        # human-readable label so downstream consumers still find the column.
+        if "interval_name" not in merged.columns:
+            merged["interval_name"] = merged["interval_id"].astype(str)
         return merged[keep]
 
     # ---- tiered estimation helpers ----

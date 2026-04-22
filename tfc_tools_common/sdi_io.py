@@ -68,6 +68,35 @@ def _gpkg_connect(gpkg_path: str) -> sqlite3.Connection:
     return sqlite3.connect(gpkg_path)
 
 
+# Allow-list of characters for SQL identifiers that must be inlined into a
+# query (neither SQLite nor Postgres accept bound parameters for table or
+# column names). Any identifier that does not match this pattern is rejected
+# before string interpolation, preventing SQL injection even though the
+# underlying f-string form of the query is, by construction, unavoidable.
+#
+# Accepted: optional schema prefix, then a plain identifier
+#   e.g.  "transit_stops", "raw_onboard_instances", "transit.trips_view"
+# Rejected: anything with quotes, semicolons, spaces, parentheses, etc.
+import re as _re
+
+_SAFE_QUALIFIED_IDENT = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+_SAFE_SIMPLE_IDENT = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _safe_simple_identifier(name: str) -> str:
+    """Validate a simple SQL identifier (no schema). Raises on anything unsafe."""
+    if not isinstance(name, str) or not _SAFE_SIMPLE_IDENT.match(name):
+        raise ValueError("Unsafe SQL identifier rejected")
+    return name
+
+
+def _safe_qualified_identifier(name: str) -> str:
+    """Validate a [schema.]identifier. Raises on anything unsafe."""
+    if not isinstance(name, str) or not _SAFE_QUALIFIED_IDENT.match(name):
+        raise ValueError("Unsafe SQL identifier rejected")
+    return name
+
+
 def postgres_engine_from_qgis_connection(conn_name: str):
     """Build a SQLAlchemy engine from a QGIS 'postgres' connection name."""
     create_engine = _get_sqlalchemy_create_engine()
@@ -126,8 +155,12 @@ def read_df(source: SDISource, postgres_table: str, schema: Optional[str] = None
         return df
 
     table_name = gpkg_table_name(postgres_table)
+    safe_table = _safe_simple_identifier(table_name)
     with _gpkg_connect(source.gpkg_path) as conn:
-        df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
+        # safe_table is validated against _SAFE_SIMPLE_IDENT above; the double
+        # quotes around it defend against reserved words. There is no user
+        # input in this f-string — only an allow-listed identifier.
+        df = pd.read_sql_query(f'SELECT * FROM "{safe_table}"', conn)  # nosec B608
     return df
 
 
@@ -161,16 +194,32 @@ def read_gdf(
     where: Optional[str] = None,
     geom_col: str = "geom",
 ) -> gpd.GeoDataFrame:
-    """Read a spatial table/view as a GeoDataFrame."""
+    """Read a spatial table/view as a GeoDataFrame.
+
+    The ``postgres_table`` argument must match ``schema.name`` where both parts
+    are plain identifiers (letters, digits, underscores). The ``where``
+    argument, if given, must be one of a small allow-list of known-safe
+    predicates; this module never accepts arbitrary user SQL.
+    """
     source.validate()
 
+    # Allow-list of predicates used by internal callers. Extending this list
+    # requires a code change, not a runtime parameter — user input can never
+    # reach the WHERE clause of this query.
+    _ALLOWED_WHERE = {"geom IS NOT NULL"}
+    if where is not None and where not in _ALLOWED_WHERE:
+        raise ValueError("Unsupported WHERE predicate")
+
     if source.mode == "postgres":
+        safe_table = _safe_qualified_identifier(postgres_table)
         engine = postgres_engine_from_qgis_connection(source.conn_name)
         conn = engine.connect()
+        # safe_table is validated against _SAFE_QUALIFIED_IDENT; where is
+        # validated against _ALLOWED_WHERE. No free-form input reaches the SQL.
         if where:
-            sql = f"SELECT * FROM {postgres_table} WHERE {where}"
+            sql = f"SELECT * FROM {safe_table} WHERE {where}"  # nosec B608
         else:
-            sql = f"SELECT * FROM {postgres_table}"
+            sql = f"SELECT * FROM {safe_table}"  # nosec B608
         gdf = gpd.read_postgis(sql, con=conn, geom_col=geom_col)
         conn.close()
         engine.dispose()

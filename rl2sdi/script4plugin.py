@@ -88,24 +88,26 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     
     trips = gpd.read_postgis(
         con=observer_db_con,
-        sql=f"""
+        sql="""
         select
             *
         from
             v_trips_ext vte
         where
-            project_id = '{OBSERVER_PROJECT_ID}'
+            project_id = %(pid)s
             and deleted_at is null
             and geometry is not null
         """,
         geom_col="geometry",
+        params={"pid": OBSERVER_PROJECT_ID},
     )
 
     feedback.pushInfo("City SQL is finished")
 
     
     observer_setting_id = observer_db_con.execute(
-        text(f"""select id from settings where project_id='{OBSERVER_PROJECT_ID}' and deleted_at is null""")
+        text("select id from settings where project_id = :pid and deleted_at is null"),
+        {"pid": OBSERVER_PROJECT_ID},
     ).first()[0]
 
     
@@ -167,7 +169,8 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     # Create agencies table
     agencies = pd.read_sql(
         con=observer_db_con,
-        sql=text(f"select * from agencies where setting_id='{observer_setting_id}' and deleted_at is null"),
+        sql=text("select * from agencies where setting_id = :sid and deleted_at is null"),
+        params={"sid": observer_setting_id},
     )
 
     # there was a part specific to [69] about types of agencies that I did not add here
@@ -253,8 +256,9 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     ## Terminals
     terminals = gpd.read_postgis(
         con=observer_db_con,
-        sql=f"select * from terminals where setting_id='{observer_setting_id}' and deleted_at is null",
+        sql="select * from terminals where setting_id = %(sid)s and deleted_at is null",
         geom_col="geometry",
+        params={"sid": observer_setting_id},
     )
 
     
@@ -293,15 +297,19 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     
     # Reading the intervals from Observer
-    project_intervals = pd.read_sql(con=observer_db_con, sql=f"""
-    select i.id, "start" ,"end", i.days, name, i.deleted_at 
-    from 
-        intervals i 
-            join frequency_setting_intervals fsi on i.id = fsi.interval_id 
-            join frequency_settings fs on fsi.frequency_setting_id = fs.id
-    where 
-        fs.setting_id='{observer_setting_id}'
-    """)
+    project_intervals = pd.read_sql(
+        con=observer_db_con,
+        sql="""
+        select i.id, "start" ,"end", i.days, name, i.deleted_at
+        from
+            intervals i
+                join frequency_setting_intervals fsi on i.id = fsi.interval_id
+                join frequency_settings fs on fsi.frequency_setting_id = fs.id
+        where
+            fs.setting_id = %(sid)s
+        """,
+        params={"sid": observer_setting_id},
+    )
 
     run_ddl_sql("""
         drop table if exists transit.intervals CASCADE;
@@ -357,8 +365,10 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     observer_trips = gpd.read_postgis(
         con=observer_db_con,
-        sql=f"""select *, ST_POINT(0,0) from v_trips_ext where setting_id='{observer_setting_id}' and deleted_at is null""",
+        sql="select *, ST_POINT(0,0) from v_trips_ext "
+            "where setting_id = %(sid)s and deleted_at is null",
         geom_col="geometry",
+        params={"sid": observer_setting_id},
     )
 
     observer_trips = (
@@ -422,7 +432,9 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     
     frequency_instances = pd.read_sql(
         con=observer_db_con,
-        sql=f"select * from v_frequency_instances_ext where setting_id='{observer_setting_id}' and deleted_at is null",
+        sql="select * from v_frequency_instances_ext "
+            "where setting_id = %(sid)s and deleted_at is null",
+        params={"sid": observer_setting_id},
     )
 
     # TODO: Apply the headway on both outbound and inbound trips of a route.
@@ -573,8 +585,11 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     
     onboard_instances = gpd.read_postgis(
         con=observer_db_con,
-        sql=f"""select * from v_onboard_instances_ext where project_id='{OBSERVER_PROJECT_ID}' and deleted_at is null and geometry is not null and ST_IsValid(geometry)""",
+        sql="select * from v_onboard_instances_ext "
+            "where project_id = %(pid)s and deleted_at is null "
+            "and geometry is not null and ST_IsValid(geometry)",
         geom_col="geometry",
+        params={"pid": OBSERVER_PROJECT_ID},
     ).assign(
     matched_geometry = lambda df: df.matched_geometry.apply(wkb.loads))
 
@@ -607,8 +622,8 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     
     raw_stops = gpd.read_postgis(
         con=observer_db_con,
-        sql=f"""
-            WITH r as (select id as route_id from routes where setting_id='{observer_setting_id}'),
+        sql="""
+            WITH r as (select id as route_id from routes where setting_id = %(sid)s),
             t as (select id as trip_id from trips join r on trips.route_id = r.route_id),
             oi as (select id as oi_id, status, valid from onboard_instances join t on onboard_instances.trip_id = t.trip_id)
             select * from onboard_instance_stops tp join oi on tp.onboard_instance_id = oi.oi_id
@@ -617,6 +632,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
             and ST_IsValid(geometry)
             """,
         geom_col="geometry",
+        params={"sid": observer_setting_id},
     )
 
     
@@ -672,16 +688,17 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     trackpoints = gpd.read_postgis(
         con=observer_db_con,
-        sql=f"""
-            WITH r as (select id as route_id from routes where setting_id='{observer_setting_id}'),
+        sql="""
+            WITH r as (select id as route_id from routes where setting_id = %(sid)s),
             t as (select id as trip_id from trips join r on trips.route_id = r.route_id),
             oi as (select id as oi_id, status, valid from onboard_instances join t on onboard_instances.trip_id = t.trip_id)
             select * from onboard_instance_track_points tp join oi on tp.onboard_instance_id = oi.oi_id
             where deleted_at is null
             and geometry is not null
             and ST_IsValid(geometry)
-            """,
+            """,  # nosec B608 — static SQL text using %(name)s pyformat placeholders; no string interpolation of user values
         geom_col="geometry",
+        params={"sid": observer_setting_id},
     )
 
 
@@ -720,8 +737,9 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     identification_instances = gpd.read_postgis(
         con=observer_db_con,
-        sql=f"""select * from v_terminal_trips_ext where project_id='{OBSERVER_PROJECT_ID}' and deleted_at is null and geometry is not null and ST_IsValid(geometry)""",
+        sql="""select * from v_terminal_trips_ext where project_id = %(pid)s and deleted_at is null and geometry is not null and ST_IsValid(geometry)""",  # nosec B608 — static SQL text using %(name)s pyformat; no interpolation of user values
         geom_col="geometry",
+        params={"pid": OBSERVER_PROJECT_ID},
     )
 
     identification_instances = identification_instances.reset_index(names="gid")
@@ -739,8 +757,9 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     frequency_instances = gpd.read_postgis(
         con=observer_db_con,
-        sql=f"""select * from v_frequency_instances_ext where project_id='{OBSERVER_PROJECT_ID}' and deleted_at is null and geometry is not null and ST_IsValid(geometry)""",
+        sql="""select * from v_frequency_instances_ext where project_id = %(pid)s and deleted_at is null and geometry is not null and ST_IsValid(geometry)""",  # nosec B608 — static SQL text using %(name)s pyformat; no interpolation of user values
         geom_col="geometry",
+        params={"pid": OBSERVER_PROJECT_ID},
     )
 
     frequency_instances = frequency_instances.reset_index(names="gid")
@@ -773,8 +792,11 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     
     # Reassign representative geometry to trips using updated algorithm (Frechet distance)
-    city_db_con.execute(text( # I ADDED text() HERE
-            f"""
+    # NOTE: This SQL is a static statement with no user-supplied values interpolated.
+    # It's declared as a plain string (not an f-string) so Bandit's B608 doesn't
+    # flag it as a possible injection vector.
+    city_db_con.execute(text(  # nosec B608 — static SQL literal; no interpolation, no user input
+            """
             with recursive
 
     

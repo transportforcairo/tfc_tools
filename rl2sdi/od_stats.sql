@@ -117,7 +117,7 @@ CREATE MATERIALIZED VIEW transit.od_stats AS (
     --   distinguish on  → obs.vehicle_name      (one average per vehicle type)
     --   distinguish off → '_pooled_'::text      (pooled across vehicle types)
     -- vehicle_name is projected via MIN() so the column exists in both modes;
-    -- downstream joins use {vehicle_join_condition_*} which is empty in pool mode.
+    -- downstream joins use {{vehicle_join_condition_*}} which is empty in pool mode.
     tier1_calculated AS (
         SELECT
             obs.o_id,

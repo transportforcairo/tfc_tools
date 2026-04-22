@@ -16,6 +16,7 @@ Implementation approach (Option A):
 from __future__ import annotations
 
 import os
+import contextlib
 import sqlite3
 from datetime import datetime
 
@@ -234,10 +235,9 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             defaultValue=None,
             optional=True,
         )
-        try:
+        # Older QGIS versions may not expose FlagAdvanced on this parameter type.
+        with contextlib.suppress(Exception):
             p.setFlags(p.flags() | QgsProcessingParameterNumber.FlagAdvanced)
-        except Exception:
-            pass
         self.addParameter(p)
 
         # Stop-extraction parameters (all advanced, all with sensible defaults).
@@ -246,21 +246,34 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         add_stop_params_to_algorithm(self)
 
     # ---- SQL builders -------------------------------------------------
+    # All user values are bound via pyformat placeholders (%(name)s) and
+    # supplied through a params= dict at execute time. The builders below
+    # expect the following binds:
+    #   %(pid)s               — RouteLab project_id from the dialog
+    #   %(sid)s               — resolved setting_id (UUID from settings table)
+    #   %(dbscan_eps_m)s      — stop_params.dbscan_eps_m
+    #   %(dbscan_minpoints)s  — stop_params.dbscan_minpoints
+    #   %(snap_max_m)s        — stop_params.snap_max_m
+    #   %(terminal_m)s        — stop_params.terminal_m
+    #   %(cell_m)s            — stop_params.cell_m
+    #   %(stop_trip_buffer_m)s — stop_params.stop_trip_buffer_m
+    #   %(min_stop_spacing_m)s — stop_params.min_stop_spacing_m
+    #   %(trackpoint_buffer_m)s — stop_params.trackpoint_buffer_m
+    # Literal % signs in SQL (e.g. in LIKE '%test%') are escaped as %%.
     @staticmethod
-    def _sql_setting_id(project_id: str) -> str:
+    def _sql_setting_id() -> str:
         # Use ORDER BY id DESC to avoid relying on created_at.
-        pid = project_id.replace("'", "''")
         return (
             "SELECT id FROM settings "
-            f"WHERE project_id='{pid}' AND deleted_at IS NULL "
+            "WHERE project_id = %(pid)s AND deleted_at IS NULL "
             "ORDER BY id DESC LIMIT 1"
         )
 
     @staticmethod
-    def _cte_vehicles(sid: str) -> str:
-        return f"""
+    def _cte_vehicles() -> str:
+        return """
         rl_agencies AS (
-            SELECT * FROM agencies WHERE setting_id='{sid}' AND deleted_at IS NULL
+            SELECT * FROM agencies WHERE setting_id = %(sid)s AND deleted_at IS NULL
         ),
         transit_vehicles AS (
             SELECT
@@ -274,10 +287,10 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         """
 
     @staticmethod
-    def _cte_agencies(sid: str) -> str:
-        return f"""
+    def _cte_agencies() -> str:
+        return """
         rl_agencies AS (
-            SELECT * FROM agencies WHERE setting_id='{sid}' AND deleted_at IS NULL
+            SELECT * FROM agencies WHERE setting_id = %(sid)s AND deleted_at IS NULL
         ),
         transit_vehicles AS (
             SELECT
@@ -304,8 +317,8 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         """
 
     @staticmethod
-    def _cte_terminals(sid: str) -> str:
-        return f"""
+    def _cte_terminals() -> str:
+        return """
         transit_terminals AS (
             SELECT
                 ROW_NUMBER() OVER (ORDER BY t.id) AS gid,
@@ -313,18 +326,18 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
                 t.id::text AS observer_id,
                 t.geometry::geometry(MULTIPOLYGON,4326) AS geom
             FROM terminals t
-            WHERE t.setting_id='{sid}'
+            WHERE t.setting_id = %(sid)s
               AND t.deleted_at IS NULL
               AND t.status = 'accepted'
               AND t.geometry IS NOT NULL
               AND ST_IsValid(t.geometry)
-              AND (t.name IS NULL OR lower(t.name) NOT LIKE '%test%')
+              AND (t.name IS NULL OR lower(t.name) NOT LIKE '%%test%%')
         )
         """
 
     @staticmethod
-    def _cte_intervals(sid: str) -> str:
-        return f"""
+    def _cte_intervals() -> str:
+        return """
         transit_intervals AS (
             SELECT
                 ROW_NUMBER() OVER (ORDER BY i.start, i.end, i.id) AS gid,
@@ -336,16 +349,18 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             FROM intervals i
             JOIN frequency_setting_intervals fsi ON i.id = fsi.interval_id
             JOIN frequency_settings fs ON fsi.frequency_setting_id = fs.id
-            WHERE fs.setting_id='{sid}'
+            WHERE fs.setting_id = %(sid)s
         )
         """
 
     @staticmethod
-    def _cte_trips(sid: str) -> str:
-        # trips with stable gid ordering
+    def _cte_trips() -> str:
+        # trips with stable gid ordering. The f-string here only composes
+        # fellow CTE builders that emit their own %%(sid)s bindings — there
+        # is no user value interpolated at Python level.
         return f"""
-        {ExportRouteLabToGeoPackageAlgorithm._cte_agencies(sid)},
-        {ExportRouteLabToGeoPackageAlgorithm._cte_terminals(sid)},
+        {ExportRouteLabToGeoPackageAlgorithm._cte_agencies()},
+        {ExportRouteLabToGeoPackageAlgorithm._cte_terminals()},
         trips_raw AS (
             SELECT
                 v.id::text AS observer_id,
@@ -358,7 +373,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
                 NULLIF(v.fare::text,'')::double precision AS fare,
                 v.geometry::geometry(LINESTRING,4326) AS geom
             FROM v_trips_ext v
-            WHERE v.setting_id='{sid}'
+            WHERE v.setting_id = %(sid)s
               AND v.deleted_at IS NULL
               AND v.geometry IS NOT NULL
               AND ST_IsValid(v.geometry)
@@ -383,16 +398,16 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             JOIN transit_terminals o ON o.observer_id = tr.origin_id
             JOIN transit_terminals d ON d.observer_id = tr.destination_id
             JOIN transit_agencies a ON a.agency_id = tr.agency
-            WHERE (o.name IS NULL OR lower(o.name) NOT LIKE '%test%')
-              AND (d.name IS NULL OR lower(d.name) NOT LIKE '%test%')
+            WHERE (o.name IS NULL OR lower(o.name) NOT LIKE '%%test%%')
+              AND (d.name IS NULL OR lower(d.name) NOT LIKE '%%test%%')
         )
-        """
+        """  # nosec B608 — only composes sibling builders; no user values in f-string
 
     @staticmethod
-    def _sql_trips_view(sid: str) -> str:
+    def _sql_trips_view() -> str:
         return f"""
         WITH
-        {ExportRouteLabToGeoPackageAlgorithm._cte_trips(sid)}
+        {ExportRouteLabToGeoPackageAlgorithm._cte_trips()}
         SELECT
             t0.gid AS gid,
             t0.observer_route_id AS route_id,
@@ -422,14 +437,14 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         LEFT JOIN transit_vehicles v ON t1.vehicle_id = v.gid
         LEFT JOIN transit_terminals origin_terminal ON t0.o_id = origin_terminal.gid
         LEFT JOIN transit_terminals dest_terminal ON t0.d_id = dest_terminal.gid
-        """
+        """  # nosec B608 — only composes sibling builders; no user values in f-string
 
     @staticmethod
-    def _cte_raw_stops(sid: str) -> str:
+    def _cte_raw_stops() -> str:
         # raw stop events from onboard_instance_stops
-        return f"""
+        return """
         r AS (
-            SELECT id AS route_id FROM routes WHERE setting_id='{sid}' AND deleted_at IS NULL
+            SELECT id AS route_id FROM routes WHERE setting_id = %(sid)s AND deleted_at IS NULL
         ),
         t AS (
             SELECT id AS trip_id FROM trips JOIN r ON trips.route_id = r.route_id WHERE deleted_at IS NULL
@@ -461,11 +476,11 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         """
 
     @staticmethod
-    @staticmethod
-    def _sql_stop_clusters(sid: str, params: StopParams) -> str:
+    def _sql_stop_clusters() -> str:
+        # dbscan_eps_m / dbscan_minpoints bound at execute time via params dict.
         return f"""
         WITH
-        {ExportRouteLabToGeoPackageAlgorithm._cte_raw_stops(sid)},
+        {ExportRouteLabToGeoPackageAlgorithm._cte_raw_stops()},
         pts AS (
             SELECT
                 s.gid AS src_id,
@@ -476,7 +491,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             WHERE s.geom IS NOT NULL
         ),
         clusters AS (
-            SELECT *, ST_ClusterDBSCAN(g3857, eps := {params.dbscan_eps_m}, minpoints := {params.dbscan_minpoints}) OVER () AS cluster_id
+            SELECT *, ST_ClusterDBSCAN(g3857, eps := %(dbscan_eps_m)s, minpoints := %(dbscan_minpoints)s) OVER () AS cluster_id
             FROM pts
         ),
         valid AS (
@@ -509,20 +524,20 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             COALESCE(n.mode_name, 'Unnamed') AS mode_name
         FROM agg a
         LEFT JOIN name_mode n USING (cluster_id)
-        """
+        """  # nosec B608 — only composes sibling builders; no user values in f-string
 
     @staticmethod
-    def _sql_stops_auto(sid: str, params: StopParams) -> str:
+    def _sql_stops_auto() -> str:
         # SELECT-only version of transit.stops_auto (from create_processed_stops.sql),
         # but sourced from RouteLab (raw_stops + v_trips_ext-derived transit_trips CTE).
         return f"""
         WITH
-        {ExportRouteLabToGeoPackageAlgorithm._cte_trips(sid)},
-        stop_clusters AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stop_clusters(sid, params)}),
+        {ExportRouteLabToGeoPackageAlgorithm._cte_trips()},
+        stop_clusters AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stop_clusters()}),
         const AS (
             SELECT 250::double precision AS MIN_SPACING_M,
-                   {params.snap_max_m}::double precision  AS SNAP_MAX_M,
-                   {params.terminal_m}::double precision  AS TERMINAL_M
+                   %(snap_max_m)s::double precision  AS SNAP_MAX_M,
+                   %(terminal_m)s::double precision  AS TERMINAL_M
         ),
         c AS (
             SELECT sc.cluster_id, sc.mode_name, sc.n_points, sc.centroid,
@@ -530,7 +545,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             FROM stop_clusters sc
         ),
         spaced AS (
-            WITH params AS (SELECT {params.cell_m}::double precision AS cell_m),
+            WITH params AS (SELECT %(cell_m)s::double precision AS cell_m),
             cells AS (
                 SELECT
                     c.*,
@@ -615,7 +630,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
                 mode_name,
                 stop_type,
                 geom,
-                CASE WHEN (bearing + 360)::int % 360 BETWEEN 45 AND 225 THEN 1 ELSE 0 END AS dir_bin
+                CASE WHEN (bearing + 360)::int %% 360 BETWEEN 45 AND 225 THEN 1 ELSE 0 END AS dir_bin
             FROM bearing_calc
         )
         SELECT
@@ -631,12 +646,12 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             -- geometry when stops are edited visually in QGIS.
             geom
         FROM final
-        """
+        """  # nosec B608 — only composes sibling builders; no user values in f-string
 
     @staticmethod
-    def _sql_stops(sid: str, params: StopParams) -> str:
+    def _sql_stops() -> str:
         return f"""
-        WITH stops_auto AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stops_auto(sid, params)})
+        WITH stops_auto AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stops_auto()})
         SELECT
             ROW_NUMBER() OVER (ORDER BY stop_name, cluster_id, "double") AS gid,
             (ROW_NUMBER() OVER (ORDER BY stop_name, cluster_id, "double"))::text AS stop_id,
@@ -647,14 +662,14 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             -- stop_lon / stop_lat intentionally omitted (see _sql_stops_auto).
             geom
         FROM stops_auto
-        """
+        """  # nosec B608 — only composes sibling builders; no user values in f-string
 
     @staticmethod
-    def _sql_trip_stops_sequence(sid: str, params: StopParams) -> str:
+    def _sql_trip_stops_sequence() -> str:
         return f"""
         WITH
-        {ExportRouteLabToGeoPackageAlgorithm._cte_trips(sid)},
-        stops AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stops(sid, params)}),
+        {ExportRouteLabToGeoPackageAlgorithm._cte_trips()},
+        stops AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stops()}),
         stop_distance_along_trip AS (
             SELECT
                 ROW_NUMBER() OVER () AS gid,
@@ -666,7 +681,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
                 ST_LineLocatePoint(t.geom, s.geom) AS distance_frac,
                 a.agency_name::text AS vehicle_name
             FROM stops s
-            JOIN transit_trips t ON ST_DWithin(t.geom::geography, s.geom::geography, {params.stop_trip_buffer_m}::real)
+            JOIN transit_trips t ON ST_DWithin(t.geom::geography, s.geom::geography, %(stop_trip_buffer_m)s::real)
             LEFT JOIN transit_agencies a ON t.agency_id = a.gid
         ),
         enriched_pairs AS (
@@ -677,11 +692,11 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         )
         SELECT *
         FROM enriched_pairs
-        WHERE distance_from_prev >= {params.min_stop_spacing_m} OR distance_from_prev IS NULL
-        """
+        WHERE distance_from_prev >= %(min_stop_spacing_m)s OR distance_from_prev IS NULL
+        """  # nosec B608 — only composes sibling builders; no user values in f-string
 
     @staticmethod
-    def _sql_od_stats(sid: str, params: StopParams) -> str:
+    def _sql_od_stats(distinguish_speeds_by_vehicle: bool) -> str:
         # SELECT-only version of od_stats.sql adapted to RouteLab base tables.
         # Mirrors the tiered estimation in
         # sdi_tools/refresh_sdi_derived_algorithm.py::_build_od_stats — every
@@ -691,8 +706,11 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         #
         # The vehicle-pooling toggle expands to several SQL snippets with
         # different alias pairs; see script4plugin.py for the mirror version
-        # used by the materialized view.
-        if params.distinguish_speeds_by_vehicle:
+        # used by the materialized view. These fragments are SQL identifiers
+        # chosen from a fixed two-branch if/else — no user input crosses a
+        # trust boundary. Values (sid, trackpoint_buffer_m, etc.) ARE bound
+        # via %%(name)s placeholders at execute time.
+        if distinguish_speeds_by_vehicle:
             vehicle_group_expr          = "obs.vehicle_name"
             vehicle_join_condition_t1_s = "AND t1.vehicle_name = s.vehicle_name"
             vehicle_join_condition_c_t1 = "AND c.vehicle_name = t1.vehicle_name"
@@ -708,10 +726,10 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
 
         return f"""
         WITH
-        {ExportRouteLabToGeoPackageAlgorithm._cte_trips(sid)},
-        {ExportRouteLabToGeoPackageAlgorithm._cte_intervals(sid)},
-        stops AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stops(sid, params)}),
-        trip_stops_sequence AS ({ExportRouteLabToGeoPackageAlgorithm._sql_trip_stops_sequence(sid, params)}),
+        {ExportRouteLabToGeoPackageAlgorithm._cte_trips()},
+        {ExportRouteLabToGeoPackageAlgorithm._cte_intervals()},
+        stops AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stops()}),
+        trip_stops_sequence AS ({ExportRouteLabToGeoPackageAlgorithm._sql_trip_stops_sequence()}),
 
         od_segments AS (
             SELECT DISTINCT ON (o_id, d_id, vehicle_name, geom)
@@ -744,7 +762,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         ),
 
         -- valid onboard instances for this setting
-        r AS (SELECT id AS route_id FROM routes WHERE setting_id='{sid}' AND deleted_at IS NULL),
+        r AS (SELECT id AS route_id FROM routes WHERE setting_id = %(sid)s AND deleted_at IS NULL),
         t AS (SELECT id AS trip_id FROM trips JOIN r ON trips.route_id = r.route_id WHERE deleted_at IS NULL),
         oi AS (
             SELECT id AS instance_id, onboard_instances.trip_id::text AS trip_id, status, valid
@@ -770,7 +788,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
                 oi.trip_id
             FROM trackpoints tr
             JOIN oi ON tr.instance_id = oi.instance_id
-            JOIN stops s ON ST_DWithin(tr.geom::geography, s.geom::geography, {params.trackpoint_buffer_m})
+            JOIN stops s ON ST_DWithin(tr.geom::geography, s.geom::geography, %(trackpoint_buffer_m)s)
         ),
 
         o_timestamps AS (
@@ -1067,7 +1085,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             f.geom::geometry(LINESTRING,4326) AS geom
         FROM final f
         WHERE f.duration_final IS NOT NULL
-        """
+        """  # nosec B608 — interpolated fragments are fixed SQL constants chosen from a closed if/else; all user values use %(name)s binds
 
     # ---- main ---------------------------------------------------------
     def processAlgorithm(self, parameters, context, feedback):
@@ -1075,7 +1093,6 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
 
         rl_conn = self.parameterAsConnectionName(parameters, self.RL_CONN, context)
         project_id = self.parameterAsString(parameters, self.PROJECT_ID, context)
-        safe_project_id = project_id.replace("'", "''")
         out_gpkg = self.parameterAsFileOutput(parameters, self.OUT_GPKG, context)
         overwrite = self.parameterAsBool(parameters, self.OVERWRITE, context)
         include_raw = self.parameterAsBool(parameters, self.INCLUDE_RAW, context)
@@ -1105,54 +1122,78 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
                 con.close()
             if not ok:
                 raise Exception("Output file exists but is not a valid GeoPackage. Delete it or enable overwrite.")
-        
+
         pg_conn = self._psycopg2_conn_from_qgis_connection(rl_conn)
         feedback.pushInfo("Connecting to RouteLab Postgres (read-only)…")
 
-        # Resolve setting_id
-        setting_df = pd.read_sql_query(self._sql_setting_id(project_id), con=pg_conn)
+        # Resolve setting_id — project_id bound via params, never interpolated.
+        setting_df = pd.read_sql_query(
+            self._sql_setting_id(),
+            con=pg_conn,
+            params={"pid": project_id},
+        )
         if setting_df.empty:
             raise Exception(f"Could not find setting_id for project_id={project_id}")
-        setting_id = str(setting_df.iloc[0]["id"]) 
+        setting_id = str(setting_df.iloc[0]["id"])
         feedback.pushInfo(f"Using setting_id={setting_id}")
 
-        # Base tables
-        vehicles_sql = f"WITH {self._cte_vehicles(setting_id)} SELECT * FROM transit_vehicles"
-        agencies_sql = f"WITH {self._cte_agencies(setting_id)} SELECT * FROM transit_agencies"
-        intervals_sql = f"WITH {self._cte_intervals(setting_id)} SELECT * FROM transit_intervals"
-        terminals_sql = f"WITH {self._cte_terminals(setting_id)} SELECT * FROM transit_terminals"
-        trips_sql = f"WITH {self._cte_trips(setting_id)} SELECT * FROM transit_trips"
+        # Single bind dict used by every subsequent query. psycopg2 ignores
+        # keys a given query doesn't reference, so reusing one dict is safe.
+        q = {
+            "sid":                 setting_id,
+            "pid":                 project_id,
+            "dbscan_eps_m":        stop_params.dbscan_eps_m,
+            "dbscan_minpoints":    stop_params.dbscan_minpoints,
+            "snap_max_m":          stop_params.snap_max_m,
+            "terminal_m":          stop_params.terminal_m,
+            "cell_m":              stop_params.cell_m,
+            "stop_trip_buffer_m":  stop_params.stop_trip_buffer_m,
+            "min_stop_spacing_m":  stop_params.min_stop_spacing_m,
+            "trackpoint_buffer_m": stop_params.trackpoint_buffer_m,
+        }
 
-        vehicles = pd.read_sql_query(vehicles_sql, con=pg_conn)
-        agencies = pd.read_sql_query(agencies_sql, con=pg_conn)
-        intervals = pd.read_sql_query(intervals_sql, con=pg_conn)
-        terminals = gpd.read_postgis(terminals_sql, con=pg_conn, geom_col="geom")
-        trips = gpd.read_postgis(trips_sql, con=pg_conn, geom_col="geom")
+        # Base tables
+        vehicles_sql  = f"WITH {self._cte_vehicles()}  SELECT * FROM transit_vehicles"   # nosec B608 — composes parameterized builder
+        agencies_sql  = f"WITH {self._cte_agencies()}  SELECT * FROM transit_agencies"   # nosec B608 — composes parameterized builder
+        intervals_sql = f"WITH {self._cte_intervals()} SELECT * FROM transit_intervals"  # nosec B608 — composes parameterized builder
+        terminals_sql = f"WITH {self._cte_terminals()} SELECT * FROM transit_terminals"  # nosec B608 — composes parameterized builder
+        trips_sql     = f"WITH {self._cte_trips()}     SELECT * FROM transit_trips"      # nosec B608 — composes parameterized builder
+
+        vehicles  = pd.read_sql_query(vehicles_sql,  con=pg_conn, params=q)
+        agencies  = pd.read_sql_query(agencies_sql,  con=pg_conn, params=q)
+        intervals = pd.read_sql_query(intervals_sql, con=pg_conn, params=q)
+        terminals = gpd.read_postgis(terminals_sql,  con=pg_conn, geom_col="geom", params=q)
+        trips     = gpd.read_postgis(trips_sql,      con=pg_conn, geom_col="geom", params=q)
 
         # trips_view
         feedback.pushInfo("Computing transit.trips_view …")
-        trips_view = gpd.read_postgis(self._sql_trips_view(setting_id), con=pg_conn, geom_col="geom")
+        trips_view = gpd.read_postgis(self._sql_trips_view(), con=pg_conn, geom_col="geom", params=q)
 
         # stops / QA
         feedback.pushInfo("Computing transit stops (DBSCAN → spaced → snapped) …")
-        stops_auto = gpd.read_postgis(self._sql_stops_auto(setting_id, stop_params), con=pg_conn, geom_col="geom")
-        stops = gpd.read_postgis(self._sql_stops(setting_id, stop_params), con=pg_conn, geom_col="geom")
+        stops_auto = gpd.read_postgis(self._sql_stops_auto(), con=pg_conn, geom_col="geom", params=q)
+        stops      = gpd.read_postgis(self._sql_stops(),      con=pg_conn, geom_col="geom", params=q)
         stop_clusters = None
         if include_qa:
-            stop_clusters = gpd.read_postgis(self._sql_stop_clusters(setting_id, stop_params), con=pg_conn, geom_col="centroid")
+            stop_clusters = gpd.read_postgis(self._sql_stop_clusters(), con=pg_conn, geom_col="centroid", params=q)
 
         # trip_stops_sequence + od_stats
         feedback.pushInfo("Computing trip stop sequence …")
-        trip_stops_sequence = pd.read_sql_query(self._sql_trip_stops_sequence(setting_id, stop_params), con=pg_conn)
+        trip_stops_sequence = pd.read_sql_query(self._sql_trip_stops_sequence(), con=pg_conn, params=q)
 
         feedback.pushInfo("Computing OD stats …")
-        od_stats = gpd.read_postgis(self._sql_od_stats(setting_id, stop_params), con=pg_conn, geom_col="geom")
+        od_stats = gpd.read_postgis(
+            self._sql_od_stats(stop_params.distinguish_speeds_by_vehicle),
+            con=pg_conn, geom_col="geom", params=q,
+        )
 
         # Headway estimation (pandas) using frequency instances
         feedback.pushInfo("Estimating headways …")
         freq = pd.read_sql_query(
-            f"select * from v_frequency_instances_ext where setting_id='{setting_id}' and deleted_at is null",
+            "select * from v_frequency_instances_ext "
+            "where setting_id = %(sid)s and deleted_at is null",
             con=pg_conn,
+            params=q,
         )
         # Filter + aggregate (same logic as RL2SDI)
         if not freq.empty:
@@ -1210,17 +1251,18 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo("Exporting raw layers …")
             raw_stops = gpd.read_postgis(
                 f"""
-                WITH {self._cte_raw_stops(setting_id)}
+                WITH {self._cte_raw_stops()}
                 SELECT *
                 FROM raw_stops
-                """,
+                """,  # nosec B608 — composes parameterized builder
                 con=pg_conn,
                 geom_col="geom",
+                params=q,
             )
             raw_trackpoints = gpd.read_postgis(
-                f"""
+                """
                 WITH
-                r AS (SELECT id AS route_id FROM routes WHERE setting_id='{setting_id}' AND deleted_at IS NULL),
+                r AS (SELECT id AS route_id FROM routes WHERE setting_id = %(sid)s AND deleted_at IS NULL),
                 t AS (SELECT id AS trip_id FROM trips JOIN r ON trips.route_id = r.route_id WHERE deleted_at IS NULL),
                 oi AS (
                     SELECT id AS oi_id, status, valid
@@ -1240,43 +1282,48 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
                 """,
                 con=pg_conn,
                 geom_col="geom",
+                params=q,
             )
             raw_onboard = gpd.read_postgis(
-                f"select * from v_onboard_instances_ext where project_id='{safe_project_id}' and deleted_at is null and geometry is not null and ST_IsValid(geometry)",
+                "select * from v_onboard_instances_ext "
+                "where project_id = %(pid)s and deleted_at is null "
+                "and geometry is not null and ST_IsValid(geometry)",
                 con=pg_conn,
                 geom_col="geometry",
+                params=q,
             )
             raw_identification = gpd.read_postgis(
-                f"""
+                """
                 select *
                 from v_terminal_trips_ext
-                where project_id='{safe_project_id}'
+                where project_id = %(pid)s
                 and deleted_at is null
                 and geometry is not null
                 and ST_IsValid(geometry)
                 """,
                 con=pg_conn,
                 geom_col="geometry",
+                params=q,
             )
 
             raw_frequency = gpd.read_postgis(
-                f"""
+                """
                 select *
                 from v_frequency_instances_ext
-                where project_id='{safe_project_id}'
+                where project_id = %(pid)s
                 and deleted_at is null
                 and geometry is not null
                 and ST_IsValid(geometry)
                 """,
                 con=pg_conn,
                 geom_col="geometry",
+                params=q,
             )
 
         pg_conn.close()
-        try:
+        # Best-effort cleanup: engine disposal can fail if already closed. Non-fatal.
+        with contextlib.suppress(Exception):
             getattr(self, "_dbapi_engine", None) and self._dbapi_engine.dispose()
-        except Exception:
-            pass
 
         # Write GeoPackage
         feedback.pushInfo("Writing GeoPackage…")
