@@ -27,7 +27,7 @@ __date__ = '2025-08-28'
 __copyright__ = '(C) 2025 by Transport for Cairo'
 
 
-from .tfc_tools_common import ensure_paths
+from .tfc_tools_common import ensure_paths, check_runtime_lib_compatibility
 ensure_paths()
 # noinspection PyPep8Naming
 def classFactory(iface):  # pylint: disable=invalid-name
@@ -36,6 +36,9 @@ def classFactory(iface):  # pylint: disable=invalid-name
     :param iface: A QGIS interface instance.
     :type iface: QgsInterface
     """
+    # Soft check: warn (once per session) if pandas/geopandas/shapely/numpy are
+    # outside the tested version range. Never blocks plugin load.
+    check_runtime_lib_compatibility(show_ui=True)
     #
     from .tfc_tools import TfCToolsPlugin
     return TfCToolsPlugin()

@@ -230,8 +230,10 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
             1. SDI data source: Choose one of:
             • PostGIS (QGIS connection): select an SDI PostGIS connection with the RL2SDI SDI schema
             • GeoPackage (RouteLab SDI export): select a GeoPackage matching the TfC “RouteLab SDI GeoPackage Schema Specification”
-            2. Trip segments: segmentization threshold (meters) — (default: 300) Controls how finely trip geometries are split into segments prior to matching. Lower values create more (shorter) segments; higher values create fewer (longer) segments.
             2. Output Folder Path: Destination folder for flow outputs<br>
+        
+            <b>Advanced Parameters</b>
+            • Trip segments: segmentization threshold (meters) — (default: 300) Controls how finely trip geometries are split into segments prior to matching. Lower values create more (shorter) segments; higher values create fewer (longer) segments.<br>
 
             <b>Required SDI tables/layers</b>
             The tool reads:

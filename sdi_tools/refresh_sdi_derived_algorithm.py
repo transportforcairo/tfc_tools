@@ -142,6 +142,9 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         1. Input type / source selector
         2. Postgres connection OR GeoPackage path
         3. Include QA layers: if checked, the tool also attempts to refresh QA outputs<br>
+                       
+        <b>Advanced Parameters</b>
+        • Stop-extraction tuning — DBSCAN clustering, snap/terminal/spacing thresholds (meters), and per-vehicle vs. pooled OD travel-time speeds. Defaults preserve the historical pipeline.<br>
 
         <b>Outputs</b>
         Updated tables inside the SDI or GeoPackage<br>

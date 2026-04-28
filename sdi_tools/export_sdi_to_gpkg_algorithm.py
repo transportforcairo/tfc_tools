@@ -128,8 +128,10 @@ class ExportSDIToGeoPackageAlgorithm(QgsProcessingAlgorithm):
     <b>How to Use the Plugin</b>
     The plugin requires the following inputs:
     1. PostgreSQL SDI connection
-    2. Headway fallback value (optional, for filling missing headway_secs in trips_intervals)
-    3. Output folder<br>
+    2. Output folder<br>
+                       
+    <b>Advanced Parameters</b>
+    • Headway fallback value (optional, for trips with missing headway data).<br>
 
     <b>Outputs</b>
     • GeoPackage replicating the SDI schema<br>

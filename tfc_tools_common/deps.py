@@ -172,3 +172,138 @@ def ensure_bootstrap():
     # Public one-liner: put libs on sys.path and install if needed
     _ensure_libs_path_first()
     ensure_deps(show_ui=True)
+
+
+# ---------------------------------------------------------------------------
+# Runtime library compatibility check
+# ---------------------------------------------------------------------------
+# Some libraries (pandas, geopandas, shapely, numpy) are NOT pinned in
+# requirements.txt because they are heavyweight and typically already provided
+# by the QGIS Python environment. The trade-off is that the user may have a
+# version older or newer than what TfC Tools has been tested against.
+#
+# This module reports a single message at plugin load if any installed runtime
+# library falls outside the tested range. It never raises; the plugin still
+# loads. The check runs at most once per QGIS session.
+
+# (lower_inclusive, upper_exclusive). Set to None on either side to skip that bound.
+# Lower bounds are versions known to work. Upper bounds are the next major
+# release in which breaking changes are expected.
+RUNTIME_LIB_RANGES = {
+    "pandas":    ("2.0", "3.0"),
+    "geopandas": ("0.13", "2.0"),
+    "shapely":   ("2.0", "3.0"),
+    "numpy":     ("1.23", "3.0"),
+}
+
+_compat_check_done = False
+
+
+def _parse_version(v):
+    """Parse 'X.Y[.Z][...]' to a comparable tuple of ints.
+
+    Tolerant of suffixes like '2.2.3.dev0+abc' or '1.26.4rc1'; trailing
+    non-numeric junk is dropped. Returns () on parse failure (which compares
+    less than any real version, so an unparseable version is treated as
+    "below floor" — the safer side to err on)."""
+    if not isinstance(v, str):
+        return ()
+    parts = []
+    for chunk in v.split(".")[:3]:
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _get_installed_version(dist_name):
+    """Return the installed version string for a top-level package, or None."""
+    try:
+        import importlib.metadata
+        return importlib.metadata.version(dist_name)
+    except Exception:
+        return None
+
+
+def check_runtime_lib_compatibility(show_ui=True):
+    """Check installed versions of unpinned runtime libs against tested ranges.
+
+    Reports a single QMessageBox if anything is out of range. Always safe to
+    call — exceptions are swallowed so a broken check never prevents plugin
+    load. Runs at most once per QGIS session (controlled by _compat_check_done).
+    """
+    global _compat_check_done
+    if _compat_check_done:
+        return
+    _compat_check_done = True
+
+    try:
+        too_old = []   # (name, installed, floor)
+        too_new = []   # (name, installed, ceiling)
+        missing = []   # name
+
+        for name, (lo, hi) in RUNTIME_LIB_RANGES.items():
+            installed = _get_installed_version(name)
+            if installed is None:
+                missing.append(name)
+                continue
+            iv = _parse_version(installed)
+            if not iv:
+                # Unparseable; skip rather than guess.
+                continue
+            if lo is not None and iv < _parse_version(lo):
+                too_old.append((name, installed, lo))
+            if hi is not None and iv >= _parse_version(hi):
+                too_new.append((name, installed, hi))
+
+        if not (too_old or too_new or missing):
+            return
+
+        lines = []
+        if missing:
+            lines.append(
+                "Missing libraries (the plugin will not run without these):\n  - "
+                + "\n  - ".join(missing)
+            )
+        if too_old:
+            lines.append(
+                "Below the tested floor (older than what TfC Tools has been tested with;\n"
+                "the plugin may still work but some features could fail):\n  - "
+                + "\n  - ".join(f"{n} {v} (tested with >= {floor})" for n, v, floor in too_old)
+            )
+        if too_new:
+            lines.append(
+                "Above the tested ceiling (newer than what TfC Tools has been tested with;\n"
+                "watch for silently incorrect results — for example, merges returning empty):\n  - "
+                + "\n  - ".join(f"{n} {v} (tested with < {ceil})" for n, v, ceil in too_new)
+            )
+        msg = (
+            "TfC Tools detected runtime library versions outside its tested range.\n\n"
+            + "\n\n".join(lines)
+            + "\n\nThe plugin will continue to load. If you encounter unexpected "
+              "behaviour, consider aligning your QGIS Python environment to the "
+              "tested versions, or report the issue to TfC."
+        )
+
+        # Log to QGIS message panel (always)
+        try:
+            from qgis.core import QgsMessageLog, Qgis
+            QgsMessageLog.logMessage(msg, "TfC Tools", Qgis.Warning)
+        except Exception:
+            pass
+
+        # Modal once per session (only if UI requested and a Qt app exists)
+        if show_ui:
+            try:
+                QMessageBox.warning(None, "TfC Tools: library version check", msg)
+            except Exception:
+                pass
+    except Exception:
+        # Never let the version check itself break plugin load.
+        pass

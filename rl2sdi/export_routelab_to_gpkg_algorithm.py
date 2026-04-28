@@ -136,8 +136,11 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
     The plugin requires the following inputs:
     1. RouteLab database connection (credentials provided by TfC)
     2. Project ID — the unique identifier for your RouteLab project
-    3. Headways (optional, for trips with missing headway data)
-    4. Output folder<br>
+    3. Output folder<br>
+                       
+    <b>Advanced Parameters</b>
+    • Headway fallback value (optional, for trips with missing headway data).
+    • Stop-extraction tuning — DBSCAN clustering, snap/terminal/spacing thresholds (meters), and per-vehicle vs. pooled OD travel-time speeds. Defaults preserve the historical pipeline.<br>
 
     <b>Outputs</b>
     • GeoPackage containing standardized tables (raw and transit equivalents)<br>

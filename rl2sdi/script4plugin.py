@@ -423,7 +423,11 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         ]
     ]
 
-    observer_trips["fare"] = pd.to_numeric(observer_trips["fare"], errors="ignore")
+    # pandas 3.0 removed errors="ignore" from to_numeric. Use "coerce": non-numeric
+    # values become NaN, which the next line fills with the column mean (the previous
+    # behavior of "ignore" — keeping the original object dtype — would have caused
+    # the .mean() call below to fail anyway on any truly non-numeric input).
+    observer_trips["fare"] = pd.to_numeric(observer_trips["fare"], errors="coerce")
     print(observer_trips['fare'].isna().sum())
     observer_trips.fare = observer_trips.fare.fillna(np.ceil(observer_trips.fare.mean()))
 
@@ -463,8 +467,9 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
 
     trips = trips.merge(valid_frequency_instances[["trip_id", "interval", "avg_headway_sec"]], left_on=['observer_id', 'interval'], right_on=['trip_id', 'interval'], how='left')
 
+    # pandas 3.0 removed the `method=` keyword on fillna; use the dedicated ffill/bfill methods.
     trips['avg_headway_sec'] = trips.groupby(['observer_route_id', 'interval'], group_keys=True)['avg_headway_sec'].apply(
-        lambda df: df.fillna(method='ffill').fillna(method='bfill')).reset_index(drop=True, level=[0,1])
+        lambda df: df.ffill().bfill()).reset_index(drop=True, level=[0,1])
 
     trips['avg_headway_agency_interval'] = trips.groupby(['agency_id', 'interval'])[
         'avg_headway_sec'].transform('mean')

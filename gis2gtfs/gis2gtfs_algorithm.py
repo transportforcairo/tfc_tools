@@ -177,12 +177,24 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        self.addParameter(
-            QgsProcessingParameterString(
-                self.SERVICE_ID,
-                self.tr('Service ID (e.g., Ground_Daily)')
-            )
+        # Legacy fallback only. calendar.py now derives service_ids
+        # dynamically from the mon..sun columns in transit_intervals (e.g.
+        # svc_daily, svc_weekday, svc_weekend). This field is used ONLY
+        # when the input GeoPackage was produced by an older SDI exporter
+        # that didn't carry day-of-week flags -- in that case we fall
+        # back to a single service row named "<this value>_Daily" that
+        # runs every day. For modern exports the field is ignored.
+        svc_param = QgsProcessingParameterString(
+            self.SERVICE_ID,
+            self.tr('Legacy service_id prefix (used only when intervals '
+                    'have no mon..sun columns)'),
+            defaultValue='Ground',
+            optional=True,
         )
+        svc_param.setFlags(
+            svc_param.flags() | QgsProcessingParameterDefinition.FlagAdvanced
+        )
+        self.addParameter(svc_param)
 
         self.addParameter(
             QgsProcessingParameterBoolean(
@@ -240,6 +252,9 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
         start_date = int(self.parameterAsString(parameters, self.START_DATE, context))
         end_date = int(self.parameterAsString(parameters, self.END_DATE, context))
         service_id = self.parameterAsString(parameters, self.SERVICE_ID, context)
+        # Optional + advanced field; supply a default if the user left it blank.
+        if not service_id or not service_id.strip():
+            service_id = "Ground"
         continuous = self.parameterAsBool(parameters, self.CONTINUOUS, context)
 
         # Call the GTFS build pipeline
@@ -309,10 +324,12 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
     2. Feed version (e.g. 1.0)
     3. Start date (YYYYMMDD)
     4. End date (YYYYMMDD)
-    5. Service ID (e.g. Ground_Daily)
-    6. Use continuous drop-off/pick-up (enabled by default)
-    7. Output folder 1 – temporary files (recommended: empty folder)
-    8. Output folder 2 – final GTFS files<br>
+    5. Use continuous drop-off/pick-up (enabled by default)
+    6. Output folder 1 – temporary files (recommended: empty folder)
+    7. Output folder 2 – final GTFS files<br>
+                       
+    <b>Advanced Parameters</b>
+    • Legacy service_id prefix — only used when the input GeoPackage was produced by an older exporter without mon..sun day flags. Modern exports derive services dynamically from interval day-of-week flags (e.g. svc_daily, svc_weekday, svc_weekend) and ignore this field.<br>
 
     <b>Outputs</b>
     • Intermediate files in Folder 1

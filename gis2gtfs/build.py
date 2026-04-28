@@ -85,7 +85,14 @@ def run_gtfs_pipeline(
     generate_agency(data_dir, data_raw_dir)
     print("✅ agency.txt DONE")
 
-    generate_calendar(data_dir, start_date, end_date, service_id)
+    # calendar.py now derives services dynamically from intervals.mon..sun
+    # (see the helper in gtfs_modules/_interval_expansion.py). The
+    # service_id parameter acts as a legacy fallback -- it's only used
+    # when the raw intervals.csv has no day columns (pre-refresh
+    # exporter). In the new pipeline the generated calendar.txt has one
+    # row per distinct day pattern (svc_daily, svc_weekday, etc.).
+    generate_calendar(data_dir, data_raw_dir, start_date, end_date,
+                      fallback_service_id=f"{service_id}_Daily")
     print("✅ calendar.txt DONE")
 
     generate_frequencies(data_dir, data_raw_dir)

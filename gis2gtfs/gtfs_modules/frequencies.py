@@ -1,87 +1,80 @@
 '''
-Main Steps:
-1. Load source files:
-frequencies.csv: contains trip_id, interval_id, headway_secs
-trips.geojson: contains geometries and gid (used to retrieve trip_id)
-intervals.csv: contains interval start and end times keyed by gid
-2. Join tables:
-frequencies ← joined with trips on trip_id = gid to get trip_id
-Then joined with intervals on interval_id = gid to get start_time, end_time
-3. Select and rename:
-Keep: trip_id, start_time, end_time, headway_secs
-Ensure column names match GTFS
-4. Output:
-Save as frequencies.txt in GTFS format
+Build frequencies.txt with one row per (expanded_trip_id, interval). The
+expanded trip_id carries the per-interval suffix, so (trip_id, start_time)
+is unique by construction and the GTFS duplicate_key error goes away.
+
+Inputs
+- frequencies.csv: raw transit.trips_intervals table, has (trip_id, interval_id, headway_secs)
+- trips.geojson: used to map the transit.trips.gid -> observer_id (= base trip_id)
+- intervals.csv: used for (interval start/end) and for the suffix name
+
+The merge chain here is identical to the legacy file; the only change is
+that the final trip_id is '<base>_<suffix>' instead of just '<base>'.
 '''
 import os
 import pandas as pd
 import geopandas as gpd
 
+from ._interval_expansion import load_intervals_and_suffixes, canonical_hms, expanded_trip_id
+
 
 def generate(data_dir, data_raw_dir):
-    """
-    Generate GTFS frequencies.txt by joining trips and intervals to frequency definitions.
+    '''Generate frequencies.txt with expanded per-interval trip_ids.'''
+    print("Loading raw frequency data...")
 
-    Parameters:
-        data_dir (str): Output folder for GTFS files
-        data_raw_dir (str): Input folder containing raw CSV and GeoJSON data
-    """
-    print("📥 Loading raw frequency data...")
-
-    frequencies_path = os.path.join(data_raw_dir, "frequencies.csv")
+    freq_path = os.path.join(data_raw_dir, "frequencies.csv")
     trips_path = os.path.join(data_raw_dir, "trips.geojson")
-    intervals_path = os.path.join(data_raw_dir, "intervals.csv")
     output_file = os.path.join(data_dir, "frequencies.txt")
 
-    # Load inputs
-    freq_df = pd.read_csv(frequencies_path, encoding='utf-8')
-    freq_df.rename(columns={"trip_id": "trip_id_freq"}, inplace=True) # rename field to avoid conflict with trips.geojson field of trip_id
-    trips_gdf = gpd.read_file(trips_path)[["gid","observer_id"]].copy() # copy the field "gid" and "observer_id" then rename it as "trip_id"
-    trips_gdf["trip_id"] = trips_gdf["observer_id"].astype(str)  # same as R: stringr::str_c(gid)
-    intervals_df = pd.read_csv(intervals_path, encoding='utf-8')
+    freq_df = pd.read_csv(freq_path, encoding="utf-8")
+    # Rename the incoming FK (which refers to transit.trips.gid) so it
+    # doesn't shadow the real GTFS trip_id column we're going to build.
+    freq_df = freq_df.rename(columns={"trip_id": "trip_gid"})
 
-    # Drop geometries for joining
-    trips_df = trips_gdf.drop(columns=["geometry","observer_id"], errors="ignore")
+    trips_gdf = gpd.read_file(trips_path)[["gid", "observer_id"]].copy()
+    trips_gdf["base_trip_id"] = trips_gdf["observer_id"].astype(str)
 
-    # Join trips using: frequencies.trip_id_freq = trips.gid
-    freq_df = freq_df.merge(trips_df, left_on="trip_id_freq", right_on="gid", how="inner")
-    
-    # Join intervals: frequencies.interval_id = intervals.gid
-    freq_df = freq_df.merge(intervals_df, left_on="interval_id", right_on="gid", how="left")
+    # Active intervals + suffix map.
+    iv, _suffix_by_gid = load_intervals_and_suffixes(data_raw_dir)
+    active_ids = set(iv["gid"].astype(str))
+    freq_df["interval_id"] = freq_df["interval_id"].astype(str)
+    freq_df = freq_df[freq_df["interval_id"].isin(active_ids)].copy()
 
-    # Select
-    freq_df = freq_df[["trip_id", "start_time", "end_time", "headway_secs"]]
+    # Attach base trip_id (transit.trips.gid -> observer_id).
+    freq_df = freq_df.merge(
+        trips_gdf[["gid", "base_trip_id"]],
+        left_on="trip_gid", right_on="gid", how="inner",
+    )
 
-    # GTFS times must be exactly HH:MM:SS (no microseconds, no timezone suffix).
-    # Some sources (e.g., GPKG exports that round-trip Postgres `time` through
-    # datetime.time) store '07:00:00.000000' — strip the fractional part.
-    def _to_gtfs_time(v):
-        if pd.isna(v):
-            return v
-        s = str(v).strip()
-        # Take only up to the first 8 chars (HH:MM:SS); if input was 'HH:MM', pad with :00.
-        if "." in s:
-            s = s.split(".", 1)[0]
-        if len(s) == 5 and s.count(":") == 1:  # 'HH:MM'
-            s = s + ":00"
-        return s
+    # Attach interval timing + suffix.
+    iv_keep = iv[["gid", "start_time", "end_time", "suffix"]].copy()
+    iv_keep["gid"] = iv_keep["gid"].astype(str)
+    freq_df = freq_df.merge(
+        iv_keep, left_on="interval_id", right_on="gid",
+        how="left", suffixes=("", "_iv"),
+    )
 
-    freq_df["start_time"] = freq_df["start_time"].apply(_to_gtfs_time)
-    freq_df["end_time"]   = freq_df["end_time"].apply(_to_gtfs_time)
+    # Build the expanded GTFS trip_id.
+    freq_df["trip_id"] = [
+        expanded_trip_id(bt, suf)
+        for bt, suf in zip(freq_df["base_trip_id"], freq_df["suffix"])
+    ]
 
-    # # 🚨 TEMP PATCH: Drop rows with missing headway_secs temporarily (avoid error during conversion)
-    # if freq_df["headway_secs"].isnull().any():
-    #     print("⚠️ Warning: Dropping rows with missing headway_secs (temporary fix)")
-    #     freq_df = freq_df.dropna(subset=["headway_secs"])
-    # # 🚨 END OF TEMP PATCH   
+    # Canonical HH:MM:SS for GTFS.
+    freq_df["start_time"] = freq_df["start_time"].apply(canonical_hms)
+    freq_df["end_time"] = freq_df["end_time"].apply(canonical_hms)
 
-    # # 🚨 FUTURE PATCH: Raise error if any missing headway_secs values are found
-    # if freq_df["headway_secs"].isnull().any():
-    #     raise ValueError("❌ Error: transit.frequencies table has missing values in 'headway_secs'. Please fix the SDI data.")
-    # # 🚨 END OF FUTURE PATCH
+    freq_df = freq_df[["trip_id", "start_time", "end_time", "headway_secs"]].copy()
 
-    freq_df["headway_secs"] = freq_df["headway_secs"].astype(int) # Write headway_secs as integer (no decimals)
-    
-    # Save GTFS output
-    freq_df.to_csv(output_file, index=False, encoding='utf-8')
-    print("✅ frequencies.txt written.")
+    # Guardrail: (trip_id, start_time) must be unique in frequencies.txt.
+    dup = freq_df.duplicated(subset=["trip_id", "start_time"], keep=False)
+    if dup.any():
+        sample = freq_df.loc[dup].head().to_dict("records")
+        raise ValueError(
+            "frequencies.txt has duplicate (trip_id, start_time) rows even "
+            f"after interval expansion. Sample: {sample}"
+        )
+
+    freq_df["headway_secs"] = freq_df["headway_secs"].astype(int)
+    freq_df.to_csv(output_file, index=False, encoding="utf-8")
+    print(f"frequencies.txt written ({len(freq_df)} rows).")

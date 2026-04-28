@@ -1,7 +1,7 @@
 import geopandas as gpd
 from shapely.ops import substring
 from shapely.geometry import LineString, Point
-from shapely.strtree import STRtree
+from shapely import STRtree
 import numpy as np
 import pandas as pd
 
@@ -242,7 +242,11 @@ def get_avg_occupancy_per_segment_v3_sdi_timeproxy(
     Same occupancy logic as v2, but:
       - trip segments come from SDI
       - start_time is computed per interval using od_stats.duration
-      - duration join key: (o_id, d_id, interval_name, vehicle_name)
+      - duration join key: (o_id, d_id, interval_id, vehicle_name).
+        interval_id is the stable foreign key from transit.intervals.gid;
+        interval_name is re-attached from intervals_df for downstream display/grouping.
+        If od_stats_df has only interval_name (older exports), interval_id is
+        derived from intervals_df automatically.
     Returns:
       avg_occupancy_per_trip_segment_per_interval, onboard_segments_with_occupancy, matched_stops, filtered_stops
         """
@@ -395,33 +399,68 @@ def get_avg_occupancy_per_segment_v3_sdi_timeproxy(
         )
     )
     
-# ---- Build interval-specific start_time for each (trip_id, segment_order, interval_name) using od_stats.duration ----
-    # Normalize od_stats columns: expect o_id, d_id, interval_name, vehicle_name, duration
+# ---- Build interval-specific start_time for each (trip_id, segment_order, interval_id) using od_stats.duration ----
+    # Join od_stats to intervals on the stable foreign key interval_id (not interval_name,
+    # which is a human-readable label and may be missing or renamed). interval_name is
+    # re-attached afterwards so downstream consumers that group/display on the name still work.
+
+    # ---- 1) Normalize intervals_df: ensure it has interval_id alongside interval_name ----
+    iv = intervals_df.copy()
+    if "interval_id" not in iv.columns:
+        if "gid" in iv.columns:
+            iv = iv.rename(columns={"gid": "interval_id"})
+        elif "id" in iv.columns:
+            iv = iv.rename(columns={"id": "interval_id"})
+        else:
+            raise ValueError("intervals_df must include interval_id (or gid/id).")
+    if "interval_name" not in iv.columns:
+        raise ValueError("intervals_df must include interval_name.")
+    iv = iv[["interval_id", "interval_name", "interval_start_secs", "interval_end_secs"]].drop_duplicates("interval_id")
+
+    # ---- 2) Normalize od_stats columns: required keys + duration ----
     dur = od_stats_df.copy()
     if "o_id" not in dur.columns or "d_id" not in dur.columns:
         # od_stats in your RL2SDI is stop-pair based; if column names differ, adjust here
         raise ValueError("od_stats_df must include o_id and d_id columns.")
-    if "interval_name" not in dur.columns:
-        raise ValueError("od_stats_df must include interval_name (joinable to intervals_df).")
     if "vehicle_name" not in dur.columns:
         raise ValueError("od_stats_df must include vehicle_name for speed differentiation.")
     if "duration" not in dur.columns:
         raise ValueError("od_stats_df must include duration (seconds).")
 
-    # Build a per-trip per-interval table of segment durations
+    # Ensure interval_id is present. If only interval_name is present (older exports),
+    # derive interval_id from intervals_df. The join is logically on the id, so this
+    # lookup makes the function robust to either column shape.
+    if "interval_id" not in dur.columns:
+        if "interval_name" in dur.columns:
+            dur = dur.merge(
+                iv[["interval_id", "interval_name"]],
+                on="interval_name",
+                how="left",
+            )
+            if dur["interval_id"].isna().any():
+                missing = dur.loc[dur["interval_id"].isna(), "interval_name"].dropna().unique().tolist()
+                raise ValueError(
+                    f"od_stats_df has interval_name values not found in intervals_df: {missing[:5]}"
+                )
+        else:
+            raise ValueError(
+                "od_stats_df must include interval_id (or interval_name joinable to intervals_df)."
+            )
+
+    # ---- 3) Build a per-trip per-interval table of segment durations, joined on interval_id ----
     seg = trip_segments_gdf[["trip_id", "segment_order", "from_id", "to_id", "vehicle_name"]].copy()
     seg["key"] = 1
-    i2 = intervals_df[["interval_name", "interval_start_secs", "interval_end_secs"]].copy()
+    i2 = iv[["interval_id", "interval_name", "interval_start_secs", "interval_end_secs"]].copy()
     i2["key"] = 1
     seg_i = seg.merge(i2, on="key").drop(columns="key")
 
     dur2 = dur.rename(columns={"o_id": "from_id", "d_id": "to_id"})[
-        ["from_id", "to_id", "interval_name", "vehicle_name", "duration"]
+        ["from_id", "to_id", "interval_id", "vehicle_name", "duration"]
     ].copy()
 
     seg_i = seg_i.merge(
         dur2,
-        on=["from_id", "to_id", "interval_name", "vehicle_name"],
+        on=["from_id", "to_id", "interval_id", "vehicle_name"],
         how="left"
     )
 
@@ -431,12 +470,12 @@ def get_avg_occupancy_per_segment_v3_sdi_timeproxy(
     )
     seg_i["duration"] = seg_i["duration"].fillna(seg_i["duration"].median())
 
-    seg_i = seg_i.sort_values(["trip_id", "interval_name", "segment_order"])
-    seg_i["start_time"] = seg_i.groupby(["trip_id", "interval_name"])["duration"].cumsum().shift(1).fillna(0)
+    seg_i = seg_i.sort_values(["trip_id", "interval_id", "segment_order"])
+    seg_i["start_time"] = seg_i.groupby(["trip_id", "interval_id"])["duration"].cumsum().shift(1).fillna(0)
 
     # Merge interval-specific start_time into occupancy rows
     occ = onboard_segments_with_occupancy.merge(
-        seg_i[["trip_id", "segment_order", "interval_name", "start_time", "interval_start_secs", "interval_end_secs"]],
+        seg_i[["trip_id", "segment_order", "interval_id", "interval_name", "start_time", "interval_start_secs", "interval_end_secs"]],
         on=["trip_id", "segment_order"],
         how="inner",
     )

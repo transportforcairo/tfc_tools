@@ -246,6 +246,10 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
     2. PostGIS SDI connection where the data will be migrated
     3. Enter the Project ID — the unique identifier for your RouteLab project<br>
 
+    <b>Advanced Parameters</b>
+    • Headway fallback value (optional, for trips with missing headway data).
+    • Stop-extraction tuning — DBSCAN clustering, snap/terminal/spacing thresholds (meters), and per-vehicle vs. pooled OD travel-time speeds. Defaults preserve the historical pipeline.<br>
+
     <b>Outputs</b>
     • <code>raw</code> schema: cleaned RouteLab data.
     • <code>transit</code> schema: processed, analysis-ready datasets.<br>

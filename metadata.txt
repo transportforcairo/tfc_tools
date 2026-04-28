@@ -6,7 +6,7 @@
 name=TfC Tools
 qgisMinimumVersion=3.40
 description=A suite of tools by Transport for Cairo (TfC)
-version=2.1
+version=2.2
 author=Transport for Cairo
 email=info@transportforcairo.com
 
@@ -32,7 +32,13 @@ tracker=https://github.com/transportforcairo/tfc_tools/issues
 
 # Recommended items:
 hasProcessingProvider=yes
-changelog=Version 2.1:
+changelog=Version 2.2:
+    • Dynamic GTFS calendar derived from interval day-of-week flags, replacing the hardcoded Ground_Daily / Ground_Weekdays services
+    • Per-interval trip expansion in GIS2GTFS, fixing duplicate trip/start-time errors and incorrect arrival times when intervals overlap
+    • New runtime library compatibility check at plugin load (warns on out-of-range pandas, geopandas, shapely, numpy)
+    • Forward compatibility with pandas 3.0
+    • Vehicle and Passenger Flow joins now key on stable interval IDs instead of interval names, robust to renames and legacy exports
+    Version 2.1:
     • New advanced stop-extraction parameters exposed in RL2GPKG and Refresh SDI
     • New 6-tier OD travel-time estimation with fallback cascade, tagged by calculation method
     • Big performance improvements in Refresh SDI
