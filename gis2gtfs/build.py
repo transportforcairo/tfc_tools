@@ -21,7 +21,6 @@ def run_gtfs_pipeline(
     gpkg_path,
     data_raw_dir,
     data_dir,
-    feed_name,
     feed_start_date,
     feed_end_date,
     feed_version,
@@ -41,7 +40,6 @@ def run_gtfs_pipeline(
     Args:
         data_raw_dir (str): Folder for raw extracted data
         data_dir (str): Output folder for GTFS .txt files
-        feed_name (str): GTFS feed version name (also used as feed_version if not specified)
         feed_start_date (int): YYYYMMDD
         feed_end_date (int): YYYYMMDD
         feed_version (str): GTFS feed version (shown to user apps)
@@ -79,7 +77,7 @@ def run_gtfs_pipeline(
     print("🧱 Generating GTFS components...")
 
     # commented part seems clearer but I'm not sure about generate()
-    generate_feed_info(data_dir, feed_name, feed_start_date, feed_end_date, feed_version, feed_lang)
+    generate_feed_info(data_dir, feed_start_date, feed_end_date, feed_version, feed_lang)
     print("✅ feed_info.txt DONE")
 
     generate_agency(data_dir, data_raw_dir)

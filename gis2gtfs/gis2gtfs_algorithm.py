@@ -80,7 +80,7 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
     CONN_NAME = 'CONN_NAME'
     DATA_RAW_DIR = 'DATA_RAW_DIR'
     DATA_DIR = 'DATA_DIR'
-    FEED_NAME = 'FEED_NAME'
+    FEED_VERSION = 'FEED_VERSION'
     START_DATE = 'START_DATE'
     END_DATE = 'END_DATE'
     SERVICE_ID = 'SERVICE_ID'
@@ -157,7 +157,7 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
         # 4. OTHER NEEDED INPUT 
         self.addParameter(
             QgsProcessingParameterString(
-                self.FEED_NAME,
+                self.FEED_VERSION,
                 # self.tr('Feed name (e.g., cairo)')
                 self.tr('Feed version')
             )
@@ -248,7 +248,7 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
         gpkg_path = self.parameterAsFile(parameters, self.SDI_GPKG, context)
         data_raw_dir = self.parameterAsString(parameters, self.DATA_RAW_DIR, context)
         data_dir = self.parameterAsString(parameters, self.DATA_DIR, context)
-        feed_name = self.parameterAsString(parameters, self.FEED_NAME, context)
+        feed_version = self.parameterAsString(parameters, self.FEED_VERSION, context)
         start_date = int(self.parameterAsString(parameters, self.START_DATE, context))
         end_date = int(self.parameterAsString(parameters, self.END_DATE, context))
         service_id = self.parameterAsString(parameters, self.SERVICE_ID, context)
@@ -264,10 +264,9 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
             gpkg_path=gpkg_path if source_mode == 1 else None,
             data_raw_dir=data_raw_dir,
             data_dir=data_dir,
-            feed_name=feed_name,
             feed_start_date=start_date,
             feed_end_date=end_date,
-            feed_version=1,
+            feed_version=feed_version,
             feed_lang="en",
             start_date=start_date,
             end_date=end_date,

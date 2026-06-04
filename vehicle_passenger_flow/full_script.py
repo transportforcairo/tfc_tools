@@ -82,55 +82,79 @@ def _wkb_from_geom_type(geom_type_str: str):
 
 from qgis.core import QgsCoordinateReferenceSystem
 def gdf_to_qgis_layer(gdf, layer_name):
-    """Convert a GeoDataFrame to a QGIS memory layer."""
+    """Convert a GeoDataFrame to a QGIS memory layer.
+
+    Uses a single batch ``addFeatures`` call rather than per-row ``addFeature``.
+    The per-row pattern is fragile on large layers because Qt can release the
+    underlying ``QgsVectorDataProvider`` mid-loop ("wrapped C/C++ object … has
+    been deleted") and because nullable Pandas types (Int64, boolean) leak
+    ``pd.NA`` sentinels that don't always cast cleanly to ``QVariant``.
+    """
     # Create memory layer with the same geometry type and CRS
     geom_type = gdf.geometry.iloc[0].geom_type if not gdf.empty else "Point"
-
-    # crs = gdf.crs.to_wkt() if gdf.crs else "EPSG:4326"
-    # vl = QgsVectorLayer(f"{geom_type}?crs={crs}", layer_name, "memory")
 
     crs_obj = QgsCoordinateReferenceSystem()
     if gdf.crs:
         crs_obj.createFromWkt(gdf.crs.to_wkt())
     else:
         crs_obj.createFromEpsgId(4326)
-    
+
     vl = QgsVectorLayer(f"{geom_type}?crs={crs_obj.authid()}", layer_name, "memory")
-    
-    # Add fields
-    pr = vl.dataProvider()
 
     # --- FIELD DEFINITIONS: infer type from pandas dtypes ---
-    fields = []
-    for col in gdf.columns:
-        if col == gdf.geometry.name:
-            continue
-        qtype = _qvariant_type_for_series(gdf[col])
+    geom_name = gdf.geometry.name
+    data_cols = [c for c in gdf.columns if c != geom_name]
+    fields = [QgsField(str(c), _qvariant_type_for_series(gdf[c])) for c in data_cols]
 
-        fields.append(QgsField(str(col), qtype))
-    pr.addAttributes(fields)
-
+    pr = vl.dataProvider()
+    if not pr.addAttributes(fields):
+        raise RuntimeError(f"addAttributes failed for memory layer '{layer_name}'.")
     vl.updateFields()
 
-    # --- FEATURES / ATTRIBUTES: keep native types (no str() cast) ---
-    for _, row in gdf.iterrows():
-        feat = QgsFeature()
-        feat.setGeometry(QgsGeometry.fromWkt(row.geometry.wkt))
-
-        attrs = []
-        for col in gdf.columns:
-            if col == gdf.geometry.name:
-                continue
-            val = row[col]
-            # Let QGIS handle None as NULL
+    # Sanitiser to avoid leaking pandas / numpy sentinels into QVariant
+    def _to_qvalue(val):
+        if val is None:
+            return None
+        # pd.NA, NaT, NaN, numpy NaN — all caught by pd.isna for scalars
+        try:
             if pd.isna(val):
-                attrs.append(None)
-            else:
-                attrs.append(val)
+                return None
+        except (TypeError, ValueError):
+            pass
+        # Normalise pandas/numpy scalars to native Python types
+        if isinstance(val, (np.integer,)):
+            return int(val)
+        if isinstance(val, (np.floating,)):
+            f = float(val)
+            return None if (f != f) else f  # NaN guard
+        if isinstance(val, (np.bool_,)):
+            return bool(val)
+        return val
 
-        feat.setAttributes(attrs)
-        pr.addFeature(feat)    
-    
+    # --- BUILD FEATURES IN A LIST, ADD ONCE ---
+    layer_fields = vl.fields()
+    features = []
+    geom_iter = gdf[geom_name].to_numpy()
+    # Materialise data columns into a 2D list so we don't pay per-row .iterrows() overhead
+    col_vals = [gdf[c].to_numpy() for c in data_cols]
+    n = len(gdf)
+    for i in range(n):
+        feat = QgsFeature(layer_fields)
+        g = geom_iter[i]
+        if g is None:
+            continue  # skip empty geometry rows
+        feat.setGeometry(QgsGeometry.fromWkt(g.wkt))
+        feat.setAttributes([_to_qvalue(col_vals[j][i]) for j in range(len(data_cols))])
+        features.append(feat)
+
+    if features:
+        ok, _added = pr.addFeatures(features)
+        if not ok:
+            raise RuntimeError(
+                f"addFeatures failed for memory layer '{layer_name}' "
+                f"(attempted {len(features)} features)."
+            )
+
     vl.updateExtents()
     return vl
 
@@ -435,15 +459,14 @@ class FlowEstimator:
         )
         
 
-        # ---- Occupancy using SDI segments + time proxy from transit.od_stats.duration ----
-        od_stats_df = layers["od_stats"].copy()
-
+        # ---- Occupancy using SDI segments + RouteLab-assigned interval per onboard survey ----
+        # (od_stats.duration is no longer needed for occupancy bucketing — each ride is
+        # attributed to one canonical interval directly via raw.onboard_instances.)
         avg_occ, onboard_segments_with_occupancy, matched_stops, filtered_stops = utils.get_avg_occupancy_per_segment_v3_sdi_timeproxy(
             trip_segments_gdf=trip_segments,
             intervals_df=intervals_df,
             raw_stops_gdf=raw_stops_gdf,
             onboard_instances_gdf=onboard_instances_gdf,
-            od_stats_df=od_stats_df,
             feedback=feedback
         )
 
@@ -464,6 +487,10 @@ class FlowEstimator:
         # if trip_segments["trip_id"].isna().any():
         #     raise ValueError("trip_segments: gid->observer_id mapping produced NaNs. Check that trip_segments.trip_id truly holds gid.")--
         
+        # Trip metadata (route, direction) for hierarchical fallback medians
+        trip_meta_cols = [c for c in ["trip_id", "route_id", "direction_id"] if c in trips_view_gdf.columns]
+        trip_meta = trips_view_gdf[trip_meta_cols].drop_duplicates("trip_id").copy()
+
         disagg = (
             trip_segments[["trip_id", "segment_order", "from_id", "to_id", "vehicle_name", "geometry"]]
             .merge(veh_supply[["trip_id", "interval_name", "vehicle_trips_in_interval"]], on="trip_id", how="left")
@@ -472,21 +499,104 @@ class FlowEstimator:
                 on=["trip_id", "segment_order", "interval_name"],
                 how="left",
             )
+            .merge(trip_meta, on="trip_id", how="left")
         )
 
         disagg["vehicle_flow"] = disagg["vehicle_trips_in_interval"].fillna(0)
-        # conservative occupancy fallback (same spirit as your existing behavior)
-        disagg["occ_median"] = disagg["occ_median"].fillna(disagg["occ_median"].median())
+
+        # ---- Hierarchical occupancy fallback with imputation tier flag ----
+        # Tier 1: observed (per-(trip, segment, interval) survey median)
+        # Tier 2: median over (route, direction, segment, interval) — sister trips
+        # Tier 3: median over (trip, segment) across intervals — same trip, different time
+        # Tier 4: median over (route, interval) — overall route load in that window
+        # Tier 5: median over (vehicle_name, interval) — system-wide for this vehicle type
+        # Tier 6: global median of observed cells
+        # Each cell gets `imputation_tier` (int 1..6) and `imputation_method` (str).
+        disagg["_observed"] = disagg["occ_median"]
+        disagg["imputation_tier"] = pd.NA
+        disagg["imputation_method"] = pd.NA
+
+        _obs_mask = disagg["_observed"].notna()
+        disagg.loc[_obs_mask, "imputation_tier"] = 1
+        disagg.loc[_obs_mask, "imputation_method"] = "observed"
+
+        def _apply_fill(df, group_keys, tier_n, method_label):
+            """Fill NaN occ_median rows using median of `_observed` over `group_keys`."""
+            keys_present = [k for k in group_keys if k in df.columns]
+            if len(keys_present) != len(group_keys):
+                return df  # required keys missing — skip this tier silently
+            src = df.loc[df["_observed"].notna(), keys_present + ["_observed"]]
+            if src.empty:
+                return df
+            fill = (
+                src.groupby(keys_present, dropna=False)["_observed"]
+                   .median()
+                   .rename("_fill_value")
+                   .reset_index()
+            )
+            miss_mask = df["occ_median"].isna()
+            if not miss_mask.any():
+                return df
+            aux = (
+                df.loc[miss_mask, keys_present]
+                  .reset_index()
+                  .merge(fill, on=keys_present, how="left")
+                  .set_index("index")
+            )
+            fill_idx = aux.index[aux["_fill_value"].notna()]
+            if len(fill_idx) == 0:
+                return df
+            df.loc[fill_idx, "occ_median"] = aux.loc[fill_idx, "_fill_value"].values
+            df.loc[fill_idx, "imputation_tier"] = tier_n
+            df.loc[fill_idx, "imputation_method"] = method_label
+            return df
+
+        disagg = _apply_fill(disagg, ["route_id", "direction_id", "segment_order", "interval_name"], 2, "route_dir_segment_interval")
+        disagg = _apply_fill(disagg, ["trip_id", "segment_order"],                                   3, "trip_segment_xinterval")
+        disagg = _apply_fill(disagg, ["route_id", "interval_name"],                                  4, "route_interval")
+        disagg = _apply_fill(disagg, ["vehicle_name", "interval_name"],                              5, "vehicle_interval")
+
+        # Tier 6: global median of all observed cells
+        _miss = disagg["occ_median"].isna()
+        if _miss.any():
+            _global = disagg.loc[disagg["_observed"].notna(), "_observed"].median()
+            if pd.isna(_global):
+                _global = 0.0
+            disagg.loc[_miss, "occ_median"] = _global
+            disagg.loc[_miss, "imputation_tier"] = 6
+            disagg.loc[_miss, "imputation_method"] = "global_median"
+
+        disagg = disagg.drop(columns=["_observed"])
+        disagg["imputation_tier"] = disagg["imputation_tier"].astype("Int64")
         disagg["occ_median"] = disagg["occ_median"].clip(lower=0)
         disagg["passenger_flow"] = np.ceil(disagg["vehicle_flow"] * disagg["occ_median"]).fillna(0)
+
+        if feedback:
+            tier_summary = (
+                disagg["imputation_method"].value_counts(dropna=False).to_dict()
+            )
+            feedback.pushInfo(f"Occupancy imputation tiers: {tier_summary}")
 
         disagg_gdf = gpd.GeoDataFrame(disagg, geometry="geometry", crs="EPSG:3857")
 
         # ---- Aggregate to stop-pair × interval (TALL) ----
-        tall = (
-            disagg_gdf.groupby(["from_id", "to_id", "interval_name"], as_index=False)[["vehicle_flow", "passenger_flow"]]
-            .sum()
+        # Aggregate flows by sum, plus carry summary stats for the imputation tier so
+        # downstream consumers know how confident each (from, to, interval) cell is:
+        #   imputation_tier_max  : worst (highest-number) tier across constituent disagg cells
+        #   imputation_observed_frac : fraction of constituent cells that were tier 1 (observed)
+        _disagg_for_agg = disagg_gdf.assign(
+            _is_observed=(disagg_gdf["imputation_tier"] == 1).astype(float)
         )
+        tall = (
+            _disagg_for_agg.groupby(["from_id", "to_id", "interval_name"], as_index=False)
+            .agg(
+                vehicle_flow=("vehicle_flow", "sum"),
+                passenger_flow=("passenger_flow", "sum"),
+                imputation_tier_max=("imputation_tier", "max"),
+                imputation_observed_frac=("_is_observed", "mean"),
+            )
+        )
+        tall["imputation_tier_max"] = tall["imputation_tier_max"].astype("Int64")
 
         flow_stop_pair_segments_overall = (
             flow_stop_pair_segments
@@ -520,16 +630,28 @@ class FlowEstimator:
         wide = flow_stop_pair_segments_overall.copy()
         for iname in intervals_df["interval_name"].unique():
             key = _safe(iname)
-            sub = tall_gdf[tall_gdf["interval_name"] == iname][["from_id", "to_id", "vehicle_flow", "passenger_flow"]]
+            sub = tall_gdf[tall_gdf["interval_name"] == iname][[
+                "from_id", "to_id", "vehicle_flow", "passenger_flow",
+                "imputation_tier_max", "imputation_observed_frac",
+            ]]
             wide = wide.merge(
                 sub.rename(columns={
                     "vehicle_flow": f"veh__{key}",
                     "passenger_flow": f"pax__{key}",
+                    "imputation_tier_max": f"tier__{key}",
+                    "imputation_observed_frac": f"obs_frac__{key}",
                 }),
                 on=["from_id", "to_id"],
                 how="left",
             )
-        wide = wide.fillna(0)
+        # Fill numeric flow/obs_frac columns with 0; for tier columns use -1 as a
+        # sentinel meaning "no trip operates on this stop pair in this interval"
+        # (valid tiers are 1..6). Avoids leaking pandas Int64 / pd.NA into the QGIS
+        # writer, which is fragile on large layers.
+        _flow_cols = [c for c in wide.columns if c.startswith("veh__") or c.startswith("pax__") or c.startswith("obs_frac__")]
+        wide[_flow_cols] = wide[_flow_cols].fillna(0)
+        for c in [c for c in wide.columns if c.startswith("tier__")]:
+            wide[c] = wide[c].fillna(-1).astype("int64")
         wide_gdf = gpd.GeoDataFrame(wide, geometry="geometry", crs="EPSG:3857")
 
         # ---- Write ONE output GeoPackage with ALL layers ----

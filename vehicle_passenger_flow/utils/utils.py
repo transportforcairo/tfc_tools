@@ -235,21 +235,37 @@ def get_avg_occupancy_per_segment_v3_sdi_timeproxy(
     intervals_df,
     raw_stops_gdf,
     onboard_instances_gdf,
-    od_stats_df,
     feedback=None
 ):
     """
-    Same occupancy logic as v2, but:
-      - trip segments come from SDI
-      - start_time is computed per interval using od_stats.duration
-      - duration join key: (o_id, d_id, interval_id, vehicle_name).
-        interval_id is the stable foreign key from transit.intervals.gid;
-        interval_name is re-attached from intervals_df for downstream display/grouping.
-        If od_stats_df has only interval_name (older exports), interval_id is
-        derived from intervals_df automatically.
+    Per-(trip, segment, interval) median occupancy from SDI onboard surveys.
+
+    Each onboard survey carries its RouteLab-assigned interval as a TEXT id
+    (raw.onboard_instances.interval_id). We join that directly to
+    transit_intervals.observer_id to obtain the canonical interval — every stop
+    event from a given survey is attributed to exactly one canonical interval,
+    regardless of where its UTC timestamp lands relative to the interval window.
+    This replaces the earlier approach of cumulating od_stats.duration along
+    each trip and filtering rows whose estimated wall-clock arrival fell inside
+    the window, which produced mid-trip-segment gaps for boundary-straddling
+    rides and was vulnerable to UTC-vs-local-time bookkeeping errors. ID-based
+    joining is also robust to weekday/weekend windows that share clock times,
+    which a (start, end) crosswalk would silently mis-attribute.
+
+    Inputs:
+      - trip_segments_gdf : per-(trip, segment_order) line geometries
+      - intervals_df      : canonical intervals; must include observer_id and
+                            interval_name (sourced from transit.intervals)
+      - raw_stops_gdf     : per-stop board/alight events with onboard_instance_observer_id
+      - onboard_instances_gdf : per-survey rows; must include id, trip_id, status,
+                                valid, departed_at, interval_id
+
     Returns:
-      avg_occupancy_per_trip_segment_per_interval, onboard_segments_with_occupancy, matched_stops, filtered_stops
-        """
+      avg_occupancy_per_trip_segment_per_interval,
+      onboard_segments_with_occupancy,
+      matched_stops,
+      filtered_stops
+    """
     
     # ------------------------------------------------------------
     # Option A: snap raw stop events directly to stop-pair segments
@@ -265,7 +281,17 @@ def get_avg_occupancy_per_segment_v3_sdi_timeproxy(
     if segments_targets.empty:
         raise ValueError("trip_segments_gdf produced no valid geometries (segments_targets is empty).")
     
-    valid_onboard_instances = onboard_instances_gdf[["id", "trip_id", "status", "valid", "departed_at"]].copy()
+    # Keep the RouteLab-assigned interval id on each survey so we can attribute the
+    # entire ride to one canonical interval without re-bucketing by timestamps.
+    _required_oi_cols = ["id", "trip_id", "status", "valid", "departed_at", "interval_id"]
+    _missing = [c for c in _required_oi_cols if c not in onboard_instances_gdf.columns]
+    if _missing:
+        raise ValueError(
+            "onboard_instances_gdf is missing required column(s): "
+            f"{_missing}. raw.onboard_instances must include interval_id (TEXT) — the "
+            "RouteLab interval id stamped on the survey at assignment time."
+        )
+    valid_onboard_instances = onboard_instances_gdf[_required_oi_cols].copy()
     valid_onboard_instances = valid_onboard_instances.query("status == 'finished'")
     valid_onboard_instances["valid"] = (
     valid_onboard_instances["valid"]
@@ -399,98 +425,88 @@ def get_avg_occupancy_per_segment_v3_sdi_timeproxy(
         )
     )
     
-# ---- Build interval-specific start_time for each (trip_id, segment_order, interval_id) using od_stats.duration ----
-    # Join od_stats to intervals on the stable foreign key interval_id (not interval_name,
-    # which is a human-readable label and may be missing or renamed). interval_name is
-    # re-attached afterwards so downstream consumers that group/display on the name still work.
+# ---- Attribute every onboard ride to its RouteLab-assigned canonical interval ----
+    # Each onboard survey row carries an interval_id (TEXT) referencing the RouteLab
+    # interval that the surveyor selected at assignment time. We join it directly to
+    # transit_intervals.observer_id to get the canonical (gid, name). This is robust to
+    # weekday/weekend windows that share clock times — a (start_time, end_time) crosswalk
+    # would silently mis-attribute those.
+    #
+    # If your RouteLab export pipeline currently writes a different agency-specific id to
+    # raw.onboard_instances.interval_id (so the join below fails), fix the exporter to
+    # write the canonical RouteLab interval id (= transit_intervals.observer_id) instead.
 
-    # ---- 1) Normalize intervals_df: ensure it has interval_id alongside interval_name ----
+    # ---- 1) Normalize intervals_df: must carry observer_id and interval_name ----
     iv = intervals_df.copy()
-    if "interval_id" not in iv.columns:
-        if "gid" in iv.columns:
-            iv = iv.rename(columns={"gid": "interval_id"})
-        elif "id" in iv.columns:
-            iv = iv.rename(columns={"id": "interval_id"})
-        else:
-            raise ValueError("intervals_df must include interval_id (or gid/id).")
     if "interval_name" not in iv.columns:
         raise ValueError("intervals_df must include interval_name.")
-    iv = iv[["interval_id", "interval_name", "interval_start_secs", "interval_end_secs"]].drop_duplicates("interval_id")
+    if "observer_id" not in iv.columns:
+        raise ValueError(
+            "intervals_df must include observer_id (the RouteLab interval id) so it can be "
+            "joined to raw.onboard_instances.interval_id."
+        )
+    iv = iv[["observer_id", "interval_name"]].drop_duplicates("observer_id").copy()
+    iv["observer_id"] = iv["observer_id"].astype(str).str.strip()
 
-    # ---- 2) Normalize od_stats columns: required keys + duration ----
-    dur = od_stats_df.copy()
-    if "o_id" not in dur.columns or "d_id" not in dur.columns:
-        # od_stats in your RL2SDI is stop-pair based; if column names differ, adjust here
-        raise ValueError("od_stats_df must include o_id and d_id columns.")
-    if "vehicle_name" not in dur.columns:
-        raise ValueError("od_stats_df must include vehicle_name for speed differentiation.")
-    if "duration" not in dur.columns:
-        raise ValueError("od_stats_df must include duration (seconds).")
-
-    # Ensure interval_id is present. If only interval_name is present (older exports),
-    # derive interval_id from intervals_df. The join is logically on the id, so this
-    # lookup makes the function robust to either column shape.
-    if "interval_id" not in dur.columns:
-        if "interval_name" in dur.columns:
-            dur = dur.merge(
-                iv[["interval_id", "interval_name"]],
-                on="interval_name",
-                how="left",
-            )
-            if dur["interval_id"].isna().any():
-                missing = dur.loc[dur["interval_id"].isna(), "interval_name"].dropna().unique().tolist()
-                raise ValueError(
-                    f"od_stats_df has interval_name values not found in intervals_df: {missing[:5]}"
-                )
-        else:
-            raise ValueError(
-                "od_stats_df must include interval_id (or interval_name joinable to intervals_df)."
-            )
-
-    # ---- 3) Build a per-trip per-interval table of segment durations, joined on interval_id ----
-    seg = trip_segments_gdf[["trip_id", "segment_order", "from_id", "to_id", "vehicle_name"]].copy()
-    seg["key"] = 1
-    i2 = iv[["interval_id", "interval_name", "interval_start_secs", "interval_end_secs"]].copy()
-    i2["key"] = 1
-    seg_i = seg.merge(i2, on="key").drop(columns="key")
-
-    dur2 = dur.rename(columns={"o_id": "from_id", "d_id": "to_id"})[
-        ["from_id", "to_id", "interval_id", "vehicle_name", "duration"]
-    ].copy()
-
-    seg_i = seg_i.merge(
-        dur2,
-        on=["from_id", "to_id", "interval_id", "vehicle_name"],
-        how="left"
+    # ---- 2) Build per-survey interval lookup keyed on the survey's instance id ----
+    if "interval_id" not in valid_onboard_instances.columns:
+        raise ValueError(
+            "valid_onboard_instances must include interval_id (TEXT) — the RouteLab interval "
+            "id stamped on each onboard survey at assignment time."
+        )
+    survey_intervals = (
+        valid_onboard_instances[["id", "interval_id"]]
+        .rename(columns={"id": "onboard_instance_observer_id"})
+        .copy()
     )
+    survey_intervals["interval_id"] = survey_intervals["interval_id"].astype(str).str.strip()
 
-    # Fallback: median by vehicle_name, then global
-    seg_i["duration"] = seg_i["duration"].fillna(
-        seg_i.groupby("vehicle_name")["duration"].transform("median")
+    # ---- 3) Direct ID join: onboard.interval_id ↔ transit_intervals.observer_id ----
+    survey_intervals = survey_intervals.merge(
+        iv.rename(columns={"observer_id": "interval_id"}),
+        on="interval_id",
+        how="left",
     )
-    seg_i["duration"] = seg_i["duration"].fillna(seg_i["duration"].median())
+    _unmatched = survey_intervals["interval_name"].isna().sum()
+    if _unmatched > 0:
+        bad = (
+            survey_intervals.loc[survey_intervals["interval_name"].isna(), ["interval_id"]]
+            .drop_duplicates()
+            .head(5)["interval_id"]
+            .tolist()
+        )
+        raise ValueError(
+            f"{_unmatched} valid onboard surveys reference interval_id values not present in "
+            f"transit_intervals.observer_id. Examples: {bad}. "
+            "This typically means the RouteLab→SDI exporter is writing an agency-specific "
+            "interval id to raw.onboard_instances.interval_id instead of the canonical "
+            "RouteLab interval id. Fix the exporter, or align the ids in the gpkg."
+        )
 
-    seg_i = seg_i.sort_values(["trip_id", "interval_id", "segment_order"])
-    seg_i["start_time"] = seg_i.groupby(["trip_id", "interval_id"])["duration"].cumsum().shift(1).fillna(0)
+    if feedback:
+        feedback.pushInfo(
+            f"Joined {len(survey_intervals)} valid surveys to "
+            f"{survey_intervals['interval_name'].nunique()} canonical interval(s) via interval_id."
+        )
 
-    # Merge interval-specific start_time into occupancy rows
+    # ---- 4) Attach canonical interval_name to every (instance × segment) occupancy row ----
     occ = onboard_segments_with_occupancy.merge(
-        seg_i[["trip_id", "segment_order", "interval_id", "interval_name", "start_time", "interval_start_secs", "interval_end_secs"]],
-        on=["trip_id", "segment_order"],
-        how="inner",
+        survey_intervals[["onboard_instance_observer_id", "interval_name"]],
+        on="onboard_instance_observer_id",
+        how="left",
     )
 
+    if occ["interval_name"].isna().any():
+        n_missing = occ["interval_name"].isna().sum()
+        raise ValueError(
+            f"{n_missing} occupancy rows have no interval after crosswalk. "
+            "Check that every onboard_instance_observer_id is present in valid_onboard_instances."
+        )
+
+    # ---- 5) Median occupancy per (trip, segment, interval) — no time-window filter ----
     avg_occupancy_per_trip_segment_per_interval = (
-        occ
-        .query(
-            "survey_departed_at + start_time < interval_end_secs & survey_departed_at + start_time > interval_start_secs"
-        )
-        .groupby(
-            ["trip_id", "segment_order", "interval_name"],
-            as_index=False,
-        )
-        .agg({"vehicle_occupancy": "median"})
-        .rename(columns={"vehicle_occupancy": "vehicle_occupancy"})
+        occ.groupby(["trip_id", "segment_order", "interval_name"], as_index=False)
+           .agg({"vehicle_occupancy": "median"})
     )
 
     return (
