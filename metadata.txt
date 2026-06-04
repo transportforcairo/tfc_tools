@@ -6,7 +6,7 @@
 name=TfC Tools
 qgisMinimumVersion=3.40
 description=A suite of tools by Transport for Cairo (TfC)
-version=2.2
+version=2.3
 author=Transport for Cairo
 email=info@transportforcairo.com
 
@@ -32,7 +32,12 @@ tracker=https://github.com/transportforcairo/tfc_tools/issues
 
 # Recommended items:
 hasProcessingProvider=yes
-changelog=Version 2.2:
+changelog=Version 2.3:
+    • GIS2GTFS feed version bug fix — feed_name no longer silently used as feed_version
+    • Interval attribution in Vehicle and Passenger Flow now ID-based (onboard_instances.interval_id → transit_intervals.observer_id), replacing timestamp bucketing
+    • 6-tier hierarchical occupancy imputation with per-cell confidence fields (imputation_tier, imputation_method), replacing single-median fallback
+    • Batch feature writing in memory layer export, fixing crashes on large layers and pandas nullable type leaks
+    Version 2.2:
     • Dynamic GTFS calendar derived from interval day-of-week flags, replacing the hardcoded Ground_Daily / Ground_Weekdays services
     • Per-interval trip expansion in GIS2GTFS, fixing duplicate trip/start-time errors and incorrect arrival times when intervals overlap
     • New runtime library compatibility check at plugin load (warns on out-of-range pandas, geopandas, shapely, numpy)
