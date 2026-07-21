@@ -30,6 +30,8 @@ __copyright__ = '(C) 2025 by Transport for Cairo'
 
 __revision__ = '$Format:%H$'
 
+import contextlib
+
 from ..tfc_tools_common import ensure_deps
 from ..tfc_tools_common.stop_params import (
     add_stop_params_to_algorithm,
@@ -121,15 +123,13 @@ class RL2SDIAlgorithm(QgsProcessingAlgorithm):
         p = QgsProcessingParameterNumber(
             self.FALLBACK_HEADWAY,
             "Headway (seconds) for empty values (optional)",
-            type=QgsProcessingParameterNumber.Integer,
+            type=QgsProcessingParameterNumber.Type.Integer,
             defaultValue=None,
             optional=True,
         )
         # Keep it advanced to avoid cluttering the main UI
-        try:
-            p.setFlags(p.flags() | QgsProcessingParameterNumber.FlagAdvanced)
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            p.setFlags(p.flags() | QgsProcessingParameterNumber.Flag.FlagAdvanced)
         self.addParameter(p)
 
         # Stop-extraction parameters (all advanced, all with sensible defaults).

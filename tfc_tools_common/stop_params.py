@@ -16,6 +16,7 @@ All distance values are in meters (EPSG:3857 / geography in PostGIS).
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, asdict, field
 
 
@@ -24,13 +25,24 @@ from dataclasses import dataclass, asdict, field
 # ---------------------------------------------------------------------------
 
 # Stop clustering (DBSCAN on raw operator-tagged stops)
-DEFAULT_DBSCAN_EPS_M = 150.0
-DEFAULT_DBSCAN_MINPOINTS = 3
-DEFAULT_CELL_M = 120.0              # grid spacing after clustering
+# v2 (direction-aware): clustering now runs PER direction, so eps/minpoints are
+# tuned for a single carriageway rather than for both merged. Validated on the
+# Sousse export at eps=40 m, minpoints=2.
+DEFAULT_DBSCAN_EPS_M = 40.0
+DEFAULT_DBSCAN_MINPOINTS = 2
+DEFAULT_CELL_M = 120.0              # DEPRECATED (v1 grid dedup); unused by the
+                                   # direction-aware SQL. Retained so the
+                                   # geopandas mirror still imports until ported.
 
 # Stop snapping / sequencing
-DEFAULT_SNAP_MAX_M = 30.0           # max cluster-to-trip snap distance
+DEFAULT_SNAP_MAX_M = 40.0           # max cluster-to-trip snap distance
 DEFAULT_TERMINAL_M = 75.0           # distance from trip start/end for Terminal
+DEFAULT_PAIR_MAX_M = 40.0           # max dir-0<->dir-1 separation to link as a pair
+DEFAULT_RESCUE_GAP_M = 300.0        # coverage rescue: keep an isolated on-route raw
+                                    # stop (DBSCAN noise) as a stop when it is farther
+                                    # than this from any confident cluster stop, so
+                                    # sparsely-surveyed corridors are not left without
+                                    # any stop. 0 disables rescue.
 DEFAULT_STOP_TRIP_BUFFER_M = 1.0    # stop-to-trip join radius for sequence
 DEFAULT_MIN_STOP_SPACING_M = 100.0  # drop consecutive stops closer than this
 
@@ -54,6 +66,8 @@ class StopParamKeys:
     CELL_M              = "cell_m"
     SNAP_MAX_M          = "snap_max_m"
     TERMINAL_M          = "terminal_m"
+    PAIR_MAX_M          = "pair_max_m"
+    RESCUE_GAP_M        = "rescue_gap_m"
     STOP_TRIP_BUFFER_M  = "stop_trip_buffer_m"
     MIN_STOP_SPACING_M  = "min_stop_spacing_m"
     TRACKPOINT_BUFFER_M = "trackpoint_buffer_m"
@@ -73,6 +87,8 @@ class StopParams:
     cell_m:              float = DEFAULT_CELL_M
     snap_max_m:          float = DEFAULT_SNAP_MAX_M
     terminal_m:          float = DEFAULT_TERMINAL_M
+    pair_max_m:          float = DEFAULT_PAIR_MAX_M
+    rescue_gap_m:        float = DEFAULT_RESCUE_GAP_M
     stop_trip_buffer_m:  float = DEFAULT_STOP_TRIP_BUFFER_M
     min_stop_spacing_m:  float = DEFAULT_MIN_STOP_SPACING_M
     trackpoint_buffer_m: float = DEFAULT_TRACKPOINT_BUFFER_M
@@ -97,6 +113,8 @@ class StopParams:
             and self.cell_m              == DEFAULT_CELL_M
             and self.snap_max_m          == DEFAULT_SNAP_MAX_M
             and self.terminal_m          == DEFAULT_TERMINAL_M
+            and self.pair_max_m          == DEFAULT_PAIR_MAX_M
+            and self.rescue_gap_m        == DEFAULT_RESCUE_GAP_M
             and self.stop_trip_buffer_m  == DEFAULT_STOP_TRIP_BUFFER_M
             and self.min_stop_spacing_m  == DEFAULT_MIN_STOP_SPACING_M
             and self.trackpoint_buffer_m == DEFAULT_TRACKPOINT_BUFFER_M
@@ -108,7 +126,8 @@ class StopParams:
         vehicle_mode = "per vehicle type" if self.distinguish_speeds_by_vehicle else "pooled across vehicle types"
         return (
             f"DBSCAN(eps={self.dbscan_eps_m}m, minpoints={self.dbscan_minpoints}), "
-            f"cell={self.cell_m}m, snap<={self.snap_max_m}m, "
+            f"snap<={self.snap_max_m}m, pair<={self.pair_max_m}m, "
+            f"rescue-gap>{self.rescue_gap_m}m, "
             f"terminal<={self.terminal_m}m, stop-trip<={self.stop_trip_buffer_m}m, "
             f"min-spacing>={self.min_stop_spacing_m}m, "
             f"trackpoint<={self.trackpoint_buffer_m}m, "
@@ -133,15 +152,13 @@ def add_stop_params_to_algorithm(algorithm) -> None:
     )
 
     def _mark_advanced(p):
-        try:
-            p.setFlags(p.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            p.setFlags(p.flags() | QgsProcessingParameterDefinition.Flag.FlagAdvanced)
         return p
 
     def _add_number(key, label, default, is_int=False, min_val=0.0):
-        ptype = (QgsProcessingParameterNumber.Integer if is_int
-                 else QgsProcessingParameterNumber.Double)
+        ptype = (QgsProcessingParameterNumber.Type.Integer if is_int
+                 else QgsProcessingParameterNumber.Type.Double)
         p = QgsProcessingParameterNumber(
             key, label, type=ptype, defaultValue=default, minValue=min_val,
         )
@@ -179,6 +196,17 @@ def add_stop_params_to_algorithm(algorithm) -> None:
         StopParamKeys.TERMINAL_M,
         "Terminal classification radius from trip endpoints (m)",
         DEFAULT_TERMINAL_M,
+    )
+    _add_number(
+        StopParamKeys.PAIR_MAX_M,
+        "Max separation to pair opposite-direction stops (m)",
+        DEFAULT_PAIR_MAX_M,
+    )
+    _add_number(
+        StopParamKeys.RESCUE_GAP_M,
+        "Coverage rescue gap — keep an isolated on-route stop when no other stop "
+        "is within this distance (m); 0 disables",
+        DEFAULT_RESCUE_GAP_M,
     )
     _add_number(
         StopParamKeys.STOP_TRIP_BUFFER_M,
@@ -223,6 +251,8 @@ def read_stop_params_from_algorithm(algorithm, parameters, context) -> StopParam
         cell_m              = _num(StopParamKeys.CELL_M)              or DEFAULT_CELL_M,
         snap_max_m          = _num(StopParamKeys.SNAP_MAX_M)          or DEFAULT_SNAP_MAX_M,
         terminal_m          = _num(StopParamKeys.TERMINAL_M)          or DEFAULT_TERMINAL_M,
+        pair_max_m          = _num(StopParamKeys.PAIR_MAX_M)          or DEFAULT_PAIR_MAX_M,
+        rescue_gap_m        = _num(StopParamKeys.RESCUE_GAP_M)        or DEFAULT_RESCUE_GAP_M,
         stop_trip_buffer_m  = _num(StopParamKeys.STOP_TRIP_BUFFER_M)  or DEFAULT_STOP_TRIP_BUFFER_M,
         min_stop_spacing_m  = _num(StopParamKeys.MIN_STOP_SPACING_M)  or DEFAULT_MIN_STOP_SPACING_M,
         trackpoint_buffer_m = _num(StopParamKeys.TRACKPOINT_BUFFER_M) or DEFAULT_TRACKPOINT_BUFFER_M,

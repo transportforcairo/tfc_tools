@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import contextlib
 from datetime import datetime
 
 import pandas as pd
@@ -29,6 +30,7 @@ from qgis.core import (
 
 from ..tfc_tools_common.deps import ensure_deps
 from ..tfc_tools_common.sdi_io import SDISource, read_df, read_gdf, gpkg_table_name
+from ..tfc_tools_common.layer_styles import embed_default_forms
 
 # for icon
 from qgis.PyQt.QtGui import QIcon
@@ -135,6 +137,9 @@ class ExportSDIToGeoPackageAlgorithm(QgsProcessingAlgorithm):
 
     <b>Outputs</b>
     • GeoPackage replicating the SDI schema<br>
+    • A default QGIS edit form embedded in the GeoPackage: the recomputed
+    transit_trips_view columns are read-only, and stop_id / agency_id carry
+    not-null / unique constraints (supports the edit-in-QGIS, re-export-GTFS workflow).<br>
 
     <b>Use Cases</b>
     • Data sharing
@@ -195,14 +200,12 @@ class ExportSDIToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         p = QgsProcessingParameterNumber(
             self.FALLBACK_HEADWAY,
             self.tr("Headway (seconds) for empty values (optional)"),
-            type=QgsProcessingParameterNumber.Integer,
+            type=QgsProcessingParameterNumber.Type.Integer,
             defaultValue=None,
             optional=True,
         )
-        try:
-            p.setFlags(p.flags() | QgsProcessingParameterNumber.FlagAdvanced)
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            p.setFlags(p.flags() | QgsProcessingParameterNumber.Flag.FlagAdvanced)
         self.addParameter(p)
 
     def processAlgorithm(self, parameters, context, feedback):
@@ -247,6 +250,17 @@ class ExportSDIToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         stops = read_gdf(source, "transit.stops", geom_col="geom")
         trips_view = read_gdf(source, "transit.trips_view", geom_col="geom")
         od_stats = read_gdf(source, "transit.od_stats", geom_col="geom")
+
+        # Base trips table. Shipping it (not just the view) makes this export's
+        # output identical to the RouteLab export, and — crucially — lets the
+        # Refresh tool fully rebuild transit_trips_view (including route_short,
+        # which needs the per-trip agency_serial that the view drops) after a
+        # user edits terminals / agencies / vehicles in QGIS.
+        try:
+            trips_base = read_gdf(source, "transit.trips", geom_col="geom")
+        except Exception as e:
+            trips_base = None
+            feedback.pushInfo(f"transit.trips base table not exported ({e}).")
 
         # Optional QA layers
         stop_clusters = None
@@ -316,6 +330,8 @@ class ExportSDIToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         # Spatial layers written after the sqlite connection closes
         
         _write_gdf(out_gpkg, "transit_stops", stops)
+        if trips_base is not None:
+            _write_gdf(out_gpkg, "transit_trips", trips_base)
         _write_gdf(out_gpkg, "transit_trips_view", trips_view)
         _write_gdf(out_gpkg, "transit_od_stats", od_stats)
 
@@ -341,5 +357,6 @@ class ExportSDIToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             if raw_frequency is not None:
                 _write_gdf(out_gpkg, "raw_frequency_instances", raw_frequency)
 
+        embed_default_forms(out_gpkg, feedback)
         feedback.pushInfo(f"GeoPackage written: {out_gpkg}")
         return {"OUT_GPKG": out_gpkg}

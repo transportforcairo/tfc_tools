@@ -124,7 +124,7 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
             self.tr('SDI PostGIS connection (required when SDI data source = PostGIS)'),
             provider='postgres'
         )
-        conn_param.setFlags(conn_param.flags() | QgsProcessingParameterDefinition.FlagOptional)
+        conn_param.setFlags(conn_param.flags() | QgsProcessingParameterDefinition.Flag.FlagOptional)
         self.addParameter(conn_param)
 
         # 1b. SDI GeoPackage (file)
@@ -132,7 +132,7 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterFile(
                 self.SDI_GPKG,
                 self.tr('SDI GeoPackage (required when SDI data source = GeoPackage)'),
-                behavior=QgsProcessingParameterFile.File,
+                behavior=QgsProcessingParameterFile.Behavior.File,
                 fileFilter='GeoPackage (*.gpkg)',
                 optional=True
             )
@@ -192,7 +192,7 @@ class GIS2GTFSAlgorithm(QgsProcessingAlgorithm):
             optional=True,
         )
         svc_param.setFlags(
-            svc_param.flags() | QgsProcessingParameterDefinition.FlagAdvanced
+            svc_param.flags() | QgsProcessingParameterDefinition.Flag.FlagAdvanced
         )
         self.addParameter(svc_param)
 

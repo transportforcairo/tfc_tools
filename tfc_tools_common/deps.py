@@ -1,8 +1,12 @@
 import os
 import sys
-import subprocess
+# nosec B404 — subprocess is required to install the plugin's pinned
+# dependencies into a plugin-local ./libs folder; see _pip_install below, where
+# the command is built in-process and run without a shell.
+import subprocess  # nosec B404
 import traceback
 import site
+import contextlib
 
 from qgis.PyQt.QtWidgets import QMessageBox
 
@@ -134,7 +138,11 @@ def ensure_deps(show_ui=True):
             creationflags = 0
 
     try:
-        proc = subprocess.run(
+        # nosec B603 — `cmd` is built entirely in-process from sys.executable plus
+        # the plugin's own pinned requirement strings (see above); no user input
+        # reaches it. It is passed as an argument list with shell=False, so there
+        # is no shell interpolation.
+        proc = subprocess.run(  # nosec B603
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -153,10 +161,8 @@ def ensure_deps(show_ui=True):
             "You can install manually with the same command."
         )
         if show_ui:
-            try:
+            with contextlib.suppress(Exception):
                 QMessageBox.critical(None, "TfC Tools: dependency install failed", msg)
-            except Exception:
-                pass
         raise
 
 
@@ -292,18 +298,14 @@ def check_runtime_lib_compatibility(show_ui=True):
         )
 
         # Log to QGIS message panel (always)
-        try:
+        with contextlib.suppress(Exception):
             from qgis.core import QgsMessageLog, Qgis
-            QgsMessageLog.logMessage(msg, "TfC Tools", Qgis.Warning)
-        except Exception:
-            pass
+            QgsMessageLog.logMessage(msg, "TfC Tools", Qgis.MessageLevel.Warning)
 
         # Modal once per session (only if UI requested and a Qt app exists)
         if show_ui:
-            try:
+            with contextlib.suppress(Exception):
                 QMessageBox.warning(None, "TfC Tools: library version check", msg)
-            except Exception:
-                pass
     except Exception:
         # Never let the version check itself break plugin load.
-        pass
+        return

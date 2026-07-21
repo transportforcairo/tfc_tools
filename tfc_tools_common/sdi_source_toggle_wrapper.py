@@ -13,6 +13,7 @@ full custom dialog.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtWidgets import QComboBox
@@ -77,10 +78,8 @@ class SDISourceToggleWidgetWrapper(WidgetWrapper):
         # Enum parameters are represented by their index
         if value is None:
             return
-        try:
+        with contextlib.suppress(Exception):
             self.widget.setCurrentIndex(int(value))
-        except Exception:
-            pass
 
     def value(self):
         return int(self.widget.currentIndex())
@@ -129,16 +128,12 @@ class SDISourceToggleWidgetWrapper(WidgetWrapper):
                     w.setEnabled(is_enabled)
             except Exception:
                 # Fallback for wrappers which may not expose wrappedWidget
-                try:
+                with contextlib.suppress(Exception):
                     if hasattr(wrapper, "widget") and wrapper.widget is not None:
                         wrapper.widget.setEnabled(is_enabled)
-                except Exception:
-                    pass
 
-            try:
+            # Some wrappers embed labels inside widgets, so this may not apply.
+            with contextlib.suppress(Exception):
                 lbl = wrapper.wrappedLabel()
                 if lbl is not None:
                     lbl.setEnabled(is_enabled)
-            except Exception:
-                # Some wrappers embed labels inside widgets
-                pass

@@ -98,14 +98,14 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
 
         # Mark optional to allow either/or with GeoPackage; enforced in checkParameterValues.
         self.parameterDefinition('SDI_CONNECTION').setFlags(
-            self.parameterDefinition('SDI_CONNECTION').flags() | QgsProcessingParameterDefinition.FlagOptional
+            self.parameterDefinition('SDI_CONNECTION').flags() | QgsProcessingParameterDefinition.Flag.FlagOptional
         )
 
         self.addParameter(
             QgsProcessingParameterFile(
                 'SDI_GPKG',
                 'SDI GeoPackage (required when SDI data source = GeoPackage)',
-                behavior=QgsProcessingParameterFile.File,
+                behavior=QgsProcessingParameterFile.Behavior.File,
                 fileFilter='GeoPackage (*.gpkg)',
                 optional=True
             )
@@ -123,11 +123,11 @@ class VehiclePassengerFlowAlgorithm(QgsProcessingAlgorithm):
         p = QgsProcessingParameterNumber(
             'TRIP_SEGMENTIZATION_THRESHOLD_M',
             'Trip segments: segmentization threshold (meters)',
-            type=QgsProcessingParameterNumber.Integer,
+            type=QgsProcessingParameterNumber.Type.Integer,
             defaultValue=300,
             minValue=1,
         )
-        p.setFlags(p.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+        p.setFlags(p.flags() | QgsProcessingParameterDefinition.Flag.FlagAdvanced)
         self.addParameter(p)
 
 

@@ -138,13 +138,13 @@ class RevenueEstimatorAlgorithm(QgsProcessingAlgorithm):
             provider="postgres",
         ))
         self.parameterDefinition(self.SDI_CONNECTION).setFlags(
-            self.parameterDefinition(self.SDI_CONNECTION).flags() | QgsProcessingParameterDefinition.FlagOptional
+            self.parameterDefinition(self.SDI_CONNECTION).flags() | QgsProcessingParameterDefinition.Flag.FlagOptional
         )
 
         self.addParameter(QgsProcessingParameterFile(
             self.SDI_GPKG,
             self.tr("SDI GeoPackage (required when SDI data source = GeoPackage)"),
-            behavior=QgsProcessingParameterFile.File,
+            behavior=QgsProcessingParameterFile.Behavior.File,
             fileFilter="GeoPackage (*.gpkg)",
             optional=True,
         ))
@@ -165,18 +165,18 @@ class RevenueEstimatorAlgorithm(QgsProcessingAlgorithm):
         ))
         self.addParameter(QgsProcessingParameterBoolean(self.DROP_ZERO_STOPS, self.tr("Drop zero-board / zero-alight stops"), defaultValue=True))
 
-        self.addParameter(QgsProcessingParameterNumber(self.BAND1_MAX, self.tr("Fare band 1: maximum route fraction"), type=QgsProcessingParameterNumber.Double, defaultValue=0.33, minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(self.BAND1_SHARE, self.tr("Fare band 1: share of full fare"), type=QgsProcessingParameterNumber.Double, defaultValue=0.50, minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(self.BAND2_MAX, self.tr("Fare band 2: maximum route fraction"), type=QgsProcessingParameterNumber.Double, defaultValue=0.66, minValue=0.0, maxValue=1.0))
-        self.addParameter(QgsProcessingParameterNumber(self.BAND2_SHARE, self.tr("Fare band 2: share of full fare"), type=QgsProcessingParameterNumber.Double, defaultValue=0.75, minValue=0.0, maxValue=1.0))
+        self.addParameter(QgsProcessingParameterNumber(self.BAND1_MAX, self.tr("Fare band 1: maximum route fraction"), type=QgsProcessingParameterNumber.Type.Double, defaultValue=0.33, minValue=0.0, maxValue=1.0))
+        self.addParameter(QgsProcessingParameterNumber(self.BAND1_SHARE, self.tr("Fare band 1: share of full fare"), type=QgsProcessingParameterNumber.Type.Double, defaultValue=0.50, minValue=0.0, maxValue=1.0))
+        self.addParameter(QgsProcessingParameterNumber(self.BAND2_MAX, self.tr("Fare band 2: maximum route fraction"), type=QgsProcessingParameterNumber.Type.Double, defaultValue=0.66, minValue=0.0, maxValue=1.0))
+        self.addParameter(QgsProcessingParameterNumber(self.BAND2_SHARE, self.tr("Fare band 2: share of full fare"), type=QgsProcessingParameterNumber.Type.Double, defaultValue=0.75, minValue=0.0, maxValue=1.0))
 
         for name, label, default in [
             (self.MIN_HEADWAY_SECS, "Minimum valid headway (seconds)", 60),
             (self.MAX_SNAP_DISTANCE_M, "Maximum stop-to-line snap distance (meters, QA only)", 100),
             (self.FINAL_LOAD_TOLERANCE, "Final load tolerance", 0),
         ]:
-            p = QgsProcessingParameterNumber(name, self.tr(label), type=QgsProcessingParameterNumber.Double, defaultValue=default, minValue=0.0)
-            p.setFlags(p.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+            p = QgsProcessingParameterNumber(name, self.tr(label), type=QgsProcessingParameterNumber.Type.Double, defaultValue=default, minValue=0.0)
+            p.setFlags(p.flags() | QgsProcessingParameterDefinition.Flag.FlagAdvanced)
             self.addParameter(p)
         for name, label, default in [
             (self.WRITE_OD_MATRIX, "Write OD matrix", True),
@@ -184,7 +184,7 @@ class RevenueEstimatorAlgorithm(QgsProcessingAlgorithm):
             (self.WRITE_QA_TABLES, "Write QA tables", True),
         ]:
             p = QgsProcessingParameterBoolean(name, self.tr(label), defaultValue=default)
-            p.setFlags(p.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
+            p.setFlags(p.flags() | QgsProcessingParameterDefinition.Flag.FlagAdvanced)
             self.addParameter(p)
 
     def checkParameterValues(self, parameters, context):

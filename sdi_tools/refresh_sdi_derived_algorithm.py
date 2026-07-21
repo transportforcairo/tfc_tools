@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import math
-from collections import Counter
+import contextlib
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -27,7 +28,10 @@ from qgis.core import (
 )
 
 from ..tfc_tools_common import ensure_paths, ensure_deps
-from ..tfc_tools_common.sdi_io import SDISource, postgres_engine_from_qgis_connection
+from ..tfc_tools_common.sdi_io import SDISource, postgres_engine_from_qgis_connection, read_df
+from ..tfc_tools_common.layer_styles import embed_default_forms
+from ..validation.gtfs_attributes import validate_gtfs_attributes
+from ..validation.key_repair import plan_key_repairs, apply_key_repairs
 from ..tfc_tools_common.stop_params import (
     StopParams,
     add_stop_params_to_algorithm,
@@ -103,6 +107,8 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
     SDI_CONNECTION = "SDI_CONNECTION"
     SDI_GPKG = "SDI_GPKG"
     INCLUDE_QA = "INCLUDE_QA"
+    STRICT_VALIDATION = "STRICT_VALIDATION"
+    APPLY_KEY_REPAIRS = "APPLY_KEY_REPAIRS"
 
     def tr(self, s: str) -> str:
         return QCoreApplication.translate(self.__class__.__name__, s)
@@ -143,8 +149,23 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         2. Postgres connection OR GeoPackage path
         3. Include QA layers: if checked, the tool also attempts to refresh QA outputs<br>
                        
+        <b>GTFS editing workflow</b>
+        This tool is the hub for the "edit layers in QGIS, then re-export GTFS" workflow.
+        Before rebuilding, it validates the GTFS-bound source attributes (stop/agency ids,
+        route_type, agency timezone, interval times, headways, and cross-layer foreign keys)
+        and reports any problems. Exported GeoPackages also carry a default edit form that
+        marks the recomputed <code>transit_trips_view</code> columns (route_short, route_long,
+        origin, destination, vehicle_name, passenger_capacity, …) read-only, and enforces
+        not-null / unique constraints on <code>stop_id</code> and <code>agency_id</code>.<br>
+
         <b>Advanced Parameters</b>
-        • Stop-extraction tuning — DBSCAN clustering, snap/terminal/spacing thresholds (meters), and per-vehicle vs. pooled OD travel-time speeds. Defaults preserve the historical pipeline.<br>
+        • Strict validation — abort the refresh if any GTFS-attribute error is found. Default
+        off: issues are reported as warnings and the refresh continues.<br>
+        • Apply safe key repairs — write the unambiguous key fixes back to the GeoPackage
+        (agency_id stored as a gid → its text code; integer FK columns stored as "1.0" → 1).
+        Default off: the fixes are only reported, never applied automatically.<br>
+        • Stop-extraction tuning — DBSCAN clustering, snap/terminal/spacing thresholds (meters),
+        and per-vehicle vs. pooled OD travel-time speeds. Defaults preserve the historical pipeline.<br>
 
         <b>Outputs</b>
         Updated tables inside the SDI or GeoPackage<br>
@@ -196,14 +217,14 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.parameterDefinition(self.SDI_CONNECTION).setFlags(
-            self.parameterDefinition(self.SDI_CONNECTION).flags() | QgsProcessingParameterDefinition.FlagOptional
+            self.parameterDefinition(self.SDI_CONNECTION).flags() | QgsProcessingParameterDefinition.Flag.FlagOptional
         )
 
         self.addParameter(
             QgsProcessingParameterFile(
                 self.SDI_GPKG,
                 self.tr("SDI GeoPackage (required when SDI data source = GeoPackage)"),
-                behavior=QgsProcessingParameterFile.File,
+                behavior=QgsProcessingParameterFile.Behavior.File,
                 fileFilter="GeoPackage (*.gpkg)",
                 optional=True,
             )
@@ -216,6 +237,30 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
                 defaultValue=False,
             )
         )
+
+        # Pre-flight validation of GTFS-bound source attributes. Always runs and
+        # reports; strict mode aborts the refresh if any ERROR-level issue is
+        # found instead of merely warning.
+        strict_param = QgsProcessingParameterBoolean(
+            self.STRICT_VALIDATION,
+            self.tr("Strict validation (abort on GTFS attribute errors)"),
+            defaultValue=False,
+        )
+        with contextlib.suppress(Exception):
+            strict_param.setFlags(strict_param.flags() | QgsProcessingParameterDefinition.Flag.FlagAdvanced)
+        self.addParameter(strict_param)
+
+        # Safe key repairs (spec section 9). Detection always runs and reports;
+        # this flag controls whether the unambiguous fixes (agency gid->code,
+        # numeric-key canonicalization) are actually written back to the gpkg.
+        repair_param = QgsProcessingParameterBoolean(
+            self.APPLY_KEY_REPAIRS,
+            self.tr("Apply safe key repairs (agency gid→code, numeric key fixes)"),
+            defaultValue=False,
+        )
+        with contextlib.suppress(Exception):
+            repair_param.setFlags(repair_param.flags() | QgsProcessingParameterDefinition.Flag.FlagAdvanced)
+        self.addParameter(repair_param)
 
         # Stop-extraction parameters (all advanced, all with sensible defaults).
         # Must match the defaults used by rl2sdi so that re-running refresh
@@ -243,6 +288,8 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
     def processAlgorithm(self, parameters, context, feedback):
         source_mode = self.parameterAsEnum(parameters, self.SDI_SOURCE, context)
         include_qa = self.parameterAsBool(parameters, self.INCLUDE_QA, context)
+        strict = self.parameterAsBool(parameters, self.STRICT_VALIDATION, context)
+        apply_repairs = self.parameterAsBool(parameters, self.APPLY_KEY_REPAIRS, context)
 
         # Read stop-extraction parameters (defaults preserved if untouched).
         stop_params = read_stop_params_from_algorithm(self, parameters, context)
@@ -251,12 +298,127 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         if source_mode == 0:
             ensure_deps(show_ui=True)
             conn_name = self.parameterAsConnectionName(parameters, self.SDI_CONNECTION, context)
+            source = SDISource(mode="postgres", conn_name=conn_name)
+            self._run_preflight_validation(source, strict, feedback)
             self._refresh_postgres(conn_name, include_qa, stop_params, feedback)
             return {"SDI_CONNECTION": conn_name}
 
         gpkg_path = self.parameterAsFile(parameters, self.SDI_GPKG, context)
+        source = SDISource(mode="gpkg", gpkg_path=gpkg_path)
+        self._run_preflight_validation(source, strict, feedback)
+        self._run_key_repairs(source, gpkg_path, apply_repairs, feedback)
         self._refresh_gpkg(gpkg_path, include_qa, stop_params, feedback)
         return {"SDI_GPKG": gpkg_path}
+
+    # ---------------- Safe key repairs (spec section 9) ----------------
+
+    # Physical layer name -> SDI table read for key repair.
+    _REPAIR_TABLES = {
+        "transit_agencies": "transit.agencies",
+        "transit_trips_view": "transit.trips_view",
+        "transit_trips": "transit.trips",
+        "transit_trips_intervals": "transit.trips_intervals",
+    }
+
+    def _run_key_repairs(self, source: SDISource, gpkg_path: str, apply_repairs: bool, feedback):
+        """Detect (and optionally apply) the safe cross-source key repairs.
+
+        Detection + reporting always runs. The gpkg is only mutated when
+        apply_repairs is True. Runs before the rebuild so cleaner keys flow into
+        the derived-layer joins. GeoPackage mode only — the PostGIS source is
+        read-only materialized views.
+        """
+        tables = {}
+        for phys, logical in self._REPAIR_TABLES.items():
+            try:
+                tables[phys] = read_df(source, logical)
+            except Exception:
+                tables[phys] = None
+
+        try:
+            plan = plan_key_repairs(tables)
+        except Exception as e:
+            feedback.reportError(f"Key-repair detection failed ({e}); skipping.")
+            return
+
+        if plan.is_empty:
+            feedback.pushInfo("Key repairs: none needed.")
+            return
+
+        feedback.pushInfo("Safe key repairs detected:")
+        for line in plan.to_lines():
+            feedback.pushInfo(f"  - {line}")
+
+        if not apply_repairs:
+            feedback.pushInfo(
+                "Report-only. Enable 'Apply safe key repairs' to write these fixes to the GeoPackage."
+            )
+            return
+
+        try:
+            summary = apply_key_repairs(gpkg_path, plan)
+            feedback.pushInfo(
+                f"Applied key repairs: {summary['agency_remapped']} agency_id remap(s), "
+                f"{summary['columns_coerced']} column(s) coerced to INTEGER."
+            )
+        except Exception as e:
+            feedback.reportError(f"Applying key repairs failed ({e}); GeoPackage left unchanged.")
+
+    # ---------------- Pre-flight GTFS attribute validation ----------------
+
+    # Logical name -> SDI table read for validation. Only the source (authored)
+    # layers are checked; derived layers are the Refresh tool's own output.
+    _VALIDATION_TABLES = {
+        "agencies": "transit.agencies",
+        "vehicles": "transit.vehicles",
+        "intervals": "transit.intervals",
+        "trips_intervals": "transit.trips_intervals",
+        "stops": "transit.stops",
+        "terminals": "transit.terminals",
+        "trips_view": "transit.trips_view",
+    }
+
+    def _run_preflight_validation(self, source: SDISource, strict: bool, feedback):
+        """Validate GTFS-bound source attributes before rebuilding derived layers.
+
+        Reports every issue as processing feedback. In strict mode, raises so the
+        refresh aborts when any ERROR-level issue is present; otherwise it only
+        warns and lets the refresh continue.
+        """
+        from qgis.core import QgsProcessingException
+
+        feedback.pushInfo("Validating GTFS-bound source attributes …")
+        tables = {}
+        for key, tbl in self._VALIDATION_TABLES.items():
+            try:
+                tables[key] = read_df(source, tbl)
+            except Exception as e:
+                tables[key] = None
+                feedback.pushInfo(f"  (skipped {tbl}: {e})")
+
+        try:
+            result = validate_gtfs_attributes(tables, strict=strict)
+        except Exception as e:
+            # Validation must never itself break the refresh. Surface and move on.
+            feedback.reportError(f"Validation step failed to run ({e}); continuing without it.")
+            return
+
+        for issue in result.issues:
+            line = issue.format()
+            if issue.severity == "ERROR":
+                feedback.reportError(line)
+            else:
+                feedback.pushWarning(line) if hasattr(feedback, "pushWarning") else feedback.pushInfo(line)
+
+        n_err, n_warn = len(result.errors), len(result.warnings)
+        feedback.pushInfo(f"Validation complete: {n_err} error(s), {n_warn} warning(s).")
+
+        if strict and result.has_errors:
+            raise QgsProcessingException(
+                f"Strict validation failed with {n_err} error(s). "
+                "Fix the reported source-attribute issues, or disable strict "
+                "validation, then re-run the refresh."
+            )
 
     # ---------------- Postgres path ----------------
 
@@ -377,6 +539,11 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         od_stats = self._build_od_stats(source, layers, trips_view, trip_stops_sequence, stop_params, feedback)
         _write_gdf(gpkg_path, "transit_od_stats", od_stats)
         feedback.pushInfo("Overwrote transit_od_stats")
+
+        # Re-assert the default edit-form (read-only derived columns + key
+        # constraints) so the lock survives the layer rewrite above and older
+        # gpkgs get upgraded on refresh.
+        embed_default_forms(gpkg_path, feedback)
         feedback.pushInfo("GeoPackage refresh completed.")
 
     def _gpkg_layer_names(self, gpkg_path: str) -> set[str]:
@@ -451,158 +618,257 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
     def _warn_skip(self, feedback, label: str, reason: str):
         feedback.reportError(f"Warning: {label} was not refreshed: {reason}")
 
-    def _try_build_stop_clusters(self, source: SDISource, layers: set[str], stop_params: StopParams, feedback) -> Optional[gpd.GeoDataFrame]:
-        if "raw_stops" not in layers:
-            self._warn_skip(feedback, "transit__stop_clusters", "raw_stops layer not found")
-            return None
+    def _attribute_and_cluster(self, source: SDISource, layers: set[str], stop_params: StopParams, feedback):
+        """Attribute each raw stop to its surveyed direction and DBSCAN PER
+        direction. Mirrors create_processed_stops.sql STEP 1.
 
-        raw_stops = self._load_required_gdf(source, layers, "raw_stops")
-        name_col = "name" if "name" in raw_stops.columns else ("raw_name" if "raw_name" in raw_stops.columns else None)
-        if name_col is None:
-            raw_stops["raw_name"] = None
-            name_col = "raw_name"
+        Returns (pts, trips) both in EPSG:3857, or (None, None). ``pts`` carries
+        columns direction_id (int), raw_name (str|None) and cluster_id
+        (int cluster, or None for DBSCAN noise → Tier-B rescue candidates).
+        """
+        if "raw_stops" not in layers or "transit_trips" not in layers:
+            return None, None
+        raw = self._load_required_gdf(source, layers, "raw_stops")
+        trips = self._load_required_gdf(source, layers, "transit_trips")
+        trips = trips[trips.geometry.notna()].copy()
+        if not {"direction_id", "observer_id"}.issubset(trips.columns):
+            return None, None
 
-        pts = raw_stops[[name_col, raw_stops.geometry.name]].copy()
-        pts = pts.rename(columns={name_col: "raw_name"}).set_geometry(raw_stops.geometry.name)
-        pts = pts[pts.geometry.notna()].to_crs(3857).reset_index(drop=True)
-        if pts.empty:
-            self._warn_skip(feedback, "transit__stop_clusters", "raw_stops has no valid geometry")
-            return None
+        # direction_id per onboard-instance id (raw stop → instance → trip).
+        dir_by_obs = {}
+        if "raw_onboard_instances" in layers:
+            oi = self._load_required_df(source, layers, "raw_onboard_instances")
+            dir_by_trip = {
+                str(o): int(d)
+                for o, d in zip(trips["observer_id"], trips["direction_id"])
+                if pd.notna(d)
+            }
+            for oid, tid in zip(oi.get("id", []), oi.get("trip_id", [])):
+                d = dir_by_trip.get(str(tid))
+                if d is not None:
+                    dir_by_obs[str(oid)] = d
+        if not dir_by_obs:
+            self._warn_skip(feedback, "transit_stops_auto",
+                            "cannot attribute raw stops to a direction "
+                            "(need raw_onboard_instances + transit_trips.observer_id/direction_id)")
+            return None, None
 
-        pts["cluster_id"] = self._dbscan_points(
-            pts.geometry,
-            eps=stop_params.dbscan_eps_m,
-            minpoints=stop_params.dbscan_minpoints,
+        obs_col = "onboard_instance_observer_id"
+        if obs_col not in raw.columns:
+            return None, None
+        name_col = "name" if "name" in raw.columns else ("raw_name" if "raw_name" in raw.columns else None)
+
+        raw = raw[raw.geometry.notna()].copy()
+        raw["direction_id"] = raw[obs_col].astype(str).map(dir_by_obs)
+        raw = raw[raw["direction_id"].notna()].copy()
+        if raw.empty:
+            return None, None
+        raw["direction_id"] = raw["direction_id"].astype(int)
+        if name_col is not None:
+            raw["raw_name"] = (raw[name_col].astype("string")
+                               .str.replace(r"\s+", " ", regex=True).str.strip())
+            raw.loc[raw["raw_name"] == "", "raw_name"] = None
+        else:
+            raw["raw_name"] = None
+
+        raw = raw.to_crs(3857).reset_index(drop=True)
+        trips = trips.to_crs(3857).reset_index(drop=True)
+
+        raw["cluster_id"] = None
+        for _d, idx in raw.groupby("direction_id").groups.items():
+            labels = self._dbscan_points(
+                raw.loc[idx, raw.geometry.name],
+                eps=stop_params.dbscan_eps_m, minpoints=stop_params.dbscan_minpoints,
+            )
+            raw.loc[idx, "cluster_id"] = pd.Series(labels, index=idx, dtype="object")
+        return raw, trips
+
+    def _snap_points(self, points, trip_geoms, snap_max_m, terminal_m):
+        """Snap each shapely Point (3857) to the nearest line in ``trip_geoms``
+        (3857, same direction). Returns a list aligned to ``points`` of
+        (snapped_point, is_terminal) or None when no line is within snap_max."""
+        out = [None] * len(points)
+        if len(points) == 0 or len(trip_geoms) == 0:
+            return out
+        tree = STRtree(np.asarray(trip_geoms))
+        pairs, dists = tree.query_nearest(
+            np.asarray(points), max_distance=snap_max_m,
+            return_distance=True, all_matches=True,
         )
+        best = {}
+        for k in range(len(pairs[0])):
+            pi = int(pairs[0][k]); ti = int(pairs[1][k]); dd = float(dists[k])
+            if pi not in best or dd < best[pi][0]:
+                best[pi] = (dd, ti)
+        for pi, (dd, ti) in best.items():
+            if dd > snap_max_m:
+                continue
+            line = trip_geoms[ti]
+            snapped = line.interpolate(line.project(points[pi]))
+            coords = list(line.coords)
+            is_term = (snapped.distance(Point(coords[0])) <= terminal_m
+                       or snapped.distance(Point(coords[-1])) <= terminal_m)
+            out[pi] = (snapped, is_term)
+        return out
+
+    def _try_build_stop_clusters(self, source: SDISource, layers: set[str], stop_params: StopParams, feedback) -> Optional[gpd.GeoDataFrame]:
+        pts, _trips = self._attribute_and_cluster(source, layers, stop_params, feedback)
+        if pts is None:
+            self._warn_skip(feedback, "transit__stop_clusters", "raw_stops / direction attribution unavailable")
+            return None
         valid = pts[pts["cluster_id"].notna()].copy()
         if valid.empty:
             self._warn_skip(feedback, "transit__stop_clusters", "no clusters met the DBSCAN threshold")
             return None
 
         rows = []
-        for cid, grp in valid.groupby("cluster_id"):
+        for (d, cid), grp in valid.groupby(["direction_id", "cluster_id"]):
             names = [str(v).strip() for v in grp["raw_name"].tolist() if pd.notna(v) and str(v).strip()]
             mode_name = Counter(names).most_common(1)[0][0] if names else "Unnamed"
             centroid = grp.geometry.unary_union.centroid
             rows.append({
+                "direction_id": int(d),
                 "cluster_id": int(cid),
                 "n_points": int(len(grp)),
                 "mode_name": mode_name,
                 "centroid": centroid,
             })
         out = gpd.GeoDataFrame(rows, geometry="centroid", crs="EPSG:3857").to_crs(4326)
-        return out[["cluster_id", "n_points", "mode_name", "centroid"]]
+        return out[["direction_id", "cluster_id", "n_points", "mode_name", "centroid"]]
 
     def _try_build_stops_auto(self, source: SDISource, layers: set[str], stop_clusters: Optional[gpd.GeoDataFrame], stop_params: StopParams, feedback) -> Optional[gpd.GeoDataFrame]:
-        if stop_clusters is None:
-            self._warn_skip(feedback, "transit_stops_auto", "transit__stop_clusters could not be rebuilt")
+        """Direction-aware stops with Tier-B coverage rescue + pairing.
+        Mirrors create_processed_stops.sql STEP 2. ``stop_clusters`` is accepted
+        for signature compatibility but the point-level attribution is recomputed
+        so DBSCAN noise (rescue candidates) is available.
+        """
+        pts, trips = self._attribute_and_cluster(source, layers, stop_params, feedback)
+        if pts is None or trips is None or trips.empty:
+            self._warn_skip(feedback, "transit_stops_auto", "attribution / clustering unavailable")
             return None
-        if "transit_trips" not in layers:
-            self._warn_skip(feedback, "transit_stops_auto", "transit_trips layer not found")
-            return None
-
-        trips = self._load_required_gdf(source, layers, "transit_trips")
-        trips = trips[trips.geometry.notna()].to_crs(3857).reset_index(drop=True)
-        if trips.empty:
-            self._warn_skip(feedback, "transit_stops_auto", "transit_trips has no valid geometry")
-            return None
-
-        sc = stop_clusters.to_crs(3857).copy()
-        cell_m = float(stop_params.cell_m)
-        sc["gx"] = (sc.geometry.x / cell_m).apply(math.floor)
-        sc["gy"] = (sc.geometry.y / cell_m).apply(math.floor)
-        sc = sc.sort_values(["gx", "gy", "n_points", "cluster_id"], ascending=[True, True, False, True])
-        spaced = sc.groupby(["gx", "gy"], as_index=False).first()
-        spaced = gpd.GeoDataFrame(spaced, geometry=stop_clusters.geometry.name, crs=sc.crs)
 
         snap_max_m = float(stop_params.snap_max_m)
         terminal_m = float(stop_params.terminal_m)
+        pair_max_m = float(stop_params.pair_max_m)
+        rescue_gap_m = float(stop_params.rescue_gap_m)
 
-        # Build an STRtree over the trip geometries and ask for each cluster
-        # centroid's NEAREST trip in a single vectorized query. This replaces
-        # the former `for cluster: trips.geometry.distance(pt)` loop — roughly
-        # 500 × 1400 distance calls done one-at-a-time in Python — with one
-        # C-accelerated call.
-        trip_geoms = np.asarray(trips.geometry.values)
-        tree = STRtree(trip_geoms)
-        cluster_geoms = np.asarray(spaced.geometry.values)
+        # Same-direction trip geometries, grouped for snapping.
+        trip_geoms_by_dir = {
+            int(d): list(trips.loc[idx, trips.geometry.name].values)
+            for d, idx in trips.groupby("direction_id").groups.items()
+        }
 
-        # query_nearest with max_distance trims non-matches upfront. On ties
-        # (cluster equidistant from two trips) shapely returns all nearest
-        # matches; we pick the smallest trip index to match the old
-        # pandas.Series.idxmin tie-breaking semantics.
-        pairs, dists = tree.query_nearest(
-            cluster_geoms, max_distance=snap_max_m, return_distance=True, all_matches=True
-        )
-        # pairs shape: [[cluster_idx, ...], [trip_idx, ...]]
-        # For each cluster index, gather all candidate (trip_idx, dist) and pick
-        # the smallest trip_idx on ties.
-        from collections import defaultdict
-        cand = defaultdict(list)
-        for k in range(len(pairs[0])):
-            cidx = int(pairs[0][k])
-            tidx = int(pairs[1][k])
-            d = float(dists[k])
-            cand[cidx].append((d, tidx))
-        # Now build per-cluster best assignment: min distance, tie-break on smallest trip index.
-        nearest_by_cluster = {c: min(v)[1] for c, v in cand.items()}
-        nearest_dist_by_cluster = {c: min(v)[0] for c, v in cand.items()}
+        stops = []            # dicts: direction_id, mode_name, stop_type, n_points, geom(3857)
+        tierA_geoms = defaultdict(list)
 
-        # Positional arrays for spaced cluster attributes (cheap column access).
-        spaced_mode_names = spaced["mode_name"].values
-        spaced_cluster_ids = spaced["cluster_id"].values
+        # ---- Tier A: confident clusters ----
+        valid = pts[pts["cluster_id"].notna()]
+        for d, grp_idx in valid.groupby("direction_id").groups.items():
+            d = int(d)
+            sub = valid.loc[grp_idx]
+            centroids, names, counts = [], [], []
+            for cid, g in sub.groupby("cluster_id"):
+                centroids.append(g.geometry.unary_union.centroid)
+                nm = [str(v).strip() for v in g["raw_name"].tolist() if pd.notna(v) and str(v).strip()]
+                names.append(Counter(nm).most_common(1)[0][0] if nm else "Unnamed")
+                counts.append(int(len(g)))
+            snapped = self._snap_points(centroids, trip_geoms_by_dir.get(d, []), snap_max_m, terminal_m)
+            for pt_snap, nm, n in zip(snapped, names, counts):
+                if pt_snap is None:
+                    continue
+                geom, is_term = pt_snap
+                stops.append({"direction_id": d, "mode_name": nm,
+                              "stop_type": "Terminal" if is_term else "Informal",
+                              "n_points": n, "geom": geom})
+                tierA_geoms[d].append(geom)
 
-        results = []
-        for cidx in range(len(spaced)):
-            if cidx not in nearest_by_cluster:
-                continue  # no trip within snap_max_m
-            tidx = nearest_by_cluster[cidx]
-            dist_m = nearest_dist_by_cluster[cidx]
-            if dist_m > snap_max_m:
+        # ---- Tier B: coverage rescue of isolated on-route noise ----
+        noise = pts[pts["cluster_id"].isna()]
+        for d, grp_idx in noise.groupby("direction_id").groups.items():
+            d = int(d)
+            sub = noise.loc[grp_idx]
+            snapped = self._snap_points(list(sub.geometry.values), trip_geoms_by_dir.get(d, []), snap_max_m, terminal_m)
+            geoms, names = [], []
+            for pt_snap, nm in zip(snapped, sub["raw_name"].tolist()):
+                if pt_snap is None:
+                    continue
+                geoms.append(pt_snap[0]); names.append(nm)
+            if not geoms:
                 continue
-            pt = cluster_geoms[cidx]
-            trip_geom = trip_geoms[tidx]
-            snap = trip_geom.interpolate(trip_geom.project(pt))
-            coords = list(trip_geom.coords)
-            start_pt = Point(coords[0])
-            end_pt = Point(coords[-1])
-            stop_type = "Terminal" if (snap.distance(start_pt) <= terminal_m or snap.distance(end_pt) <= terminal_m) else "Informal"
-            frac = trip_geom.project(snap, normalized=True)
-            a = trip_geom.interpolate(max(0.0, frac - 0.0005), normalized=True)
-            b = trip_geom.interpolate(min(1.0, frac + 0.0005), normalized=True)
-            bearing = self._bearing_degrees(a, b)
-            dir_bin = 1 if 45 <= int((bearing + 360) % 360) <= 225 else 0
-            results.append({
-                "stop_name": spaced_mode_names[cidx],
-                "location_type": 2 if stop_type == "Terminal" else 0,
-                "stop_desc": f"{spaced_mode_names[cidx]} {'(Dir 0)' if dir_bin == 0 else '(Dir 1)'}",
-                "stop_type": stop_type,
-                "cluster_id": int(spaced_cluster_ids[cidx]),
-                "double": int(dir_bin),
-                # stop_lon / stop_lat deliberately NOT stored: the geometry is
-                # the single source of truth. Downstream consumers (e.g. the
-                # gis2gtfs stops builder) must derive coordinates from geom.
-                "geometry": snap,
-            })
-        if not results:
-            self._warn_skip(feedback, "transit_stops_auto", "no stop clusters could be snapped to transit_trips")
+            # Dedup rescue candidates among themselves within rescue_gap.
+            labels = self._dbscan_points(geoms, eps=rescue_gap_m, minpoints=1)
+            groups = defaultdict(list)
+            for lab, g, nm in zip(labels, geoms, names):
+                groups[lab].append((g, nm))
+            for members in groups.values():
+                gs = [m[0] for m in members]
+                rep = Point(sum(g.x for g in gs) / len(gs), sum(g.y for g in gs) / len(gs))
+                # keep only if no confident stop within rescue_gap
+                if any(rep.distance(a) <= rescue_gap_m for a in tierA_geoms.get(d, [])):
+                    continue
+                nm = [str(m[1]).strip() for m in members if pd.notna(m[1]) and str(m[1]).strip()]
+                stops.append({"direction_id": d,
+                              "mode_name": Counter(nm).most_common(1)[0][0] if nm else "Unnamed",
+                              "stop_type": "Informal", "n_points": len(members), "geom": rep})
+
+        if not stops:
+            self._warn_skip(feedback, "transit_stops_auto", "no stops after snapping / rescue")
             return None
-        out = gpd.GeoDataFrame(results, geometry="geometry", crs="EPSG:3857").to_crs(4326)
-        return out[["stop_name", "location_type", "stop_desc", "stop_type", "cluster_id", "double", "geometry"]]
+
+        # ---- Pairing: nearest dir-0 ↔ dir-1 within pair_max (used-once) ----
+        for s in stops:
+            s["stop_group"] = None
+        d0 = [s for s in stops if s["direction_id"] == 0]
+        d1 = [s for s in stops if s["direction_id"] == 1]
+        used = set(); gcount = 0
+        for a in d0:
+            best, bd = None, float("inf")
+            for j, b in enumerate(d1):
+                if j in used:
+                    continue
+                dd = a["geom"].distance(b["geom"])
+                if dd < bd:
+                    bd, best = dd, j
+            if best is not None and bd <= pair_max_m:
+                used.add(best); b = d1[best]; gcount += 1
+                name = a["mode_name"] if a["n_points"] >= b["n_points"] else b["mode_name"]
+                if str(a["mode_name"]).lower() == "unnamed":
+                    name = b["mode_name"]
+                if str(b["mode_name"]).lower() == "unnamed":
+                    name = a["mode_name"]
+                a["stop_group"] = b["stop_group"] = f"g{gcount}"
+                a["mode_name"] = b["mode_name"] = name
+
+        out = gpd.GeoDataFrame(
+            [{"stop_name": s["mode_name"], "direction_id": s["direction_id"],
+              "location_type": 0, "stop_type": s["stop_type"],
+              "stop_group": s["stop_group"], "n_points": s["n_points"],
+              # stop_lon / stop_lat deliberately NOT stored: geometry is the
+              # single source of truth (see gis2gtfs stops builder).
+              "geometry": s["geom"]} for s in stops],
+            geometry="geometry", crs="EPSG:3857").to_crs(4326)
+        return out[["stop_name", "direction_id", "location_type", "stop_type", "stop_group", "n_points", "geometry"]]
 
     def _try_build_trips_view(self, source: SDISource, layers: set[str], feedback) -> Optional[gpd.GeoDataFrame]:
         if "transit_trips" not in layers:
-            # GeoPackage exports from rl2sdi only ship the view, not the base table.
-            # In that case there's nothing to rebuild from; the existing
-            # transit_trips_view is authoritative. Downstream steps handle this.
+            # No base table (older SDI-export gpkgs). We can't fully rebuild —
+            # route_short needs the per-trip agency_serial that the view drops —
+            # but we CAN recompute the columns that depend on the currently
+            # editable source layers: origin/destination (terminals), route_long
+            # / trip_short (from those), len_km (geometry), and vehicle_name /
+            # passenger_capacity (agency -> vehicle). This is the second-layer
+            # safety net so terminal/vehicle edits still propagate even when the
+            # base table is missing. (Current exports ship transit_trips, so this
+            # path is only hit by legacy files.)
             if "transit_trips_view" in layers:
                 feedback.pushInfo(
-                    "transit_trips base layer not present (GeoPackage export). "
-                    "Keeping the existing transit_trips_view as-is."
+                    "transit_trips base layer not present; recomputing terminal/"
+                    "vehicle/geometry-derived columns from the existing "
+                    "transit_trips_view (route_short left as-is — needs the base table)."
                 )
-            else:
-                self._warn_skip(feedback, "transit_trips_view",
-                                "neither transit_trips nor transit_trips_view found")
+                return self._recompute_view_from_view(source, layers, feedback)
+            self._warn_skip(feedback, "transit_trips_view",
+                            "neither transit_trips nor transit_trips_view found")
             return None
 
         trips = self._load_required_gdf(source, layers, "transit_trips")
@@ -714,6 +980,68 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
         keep = [c for c in keep if c in df.columns]
         out = df[keep].rename(columns={"observer_route_id": "route_id", df.geometry.name: "geometry"})
         return gpd.GeoDataFrame(out, geometry="geometry", crs=trips.crs)
+
+    def _recompute_view_from_view(self, source: SDISource, layers: set[str], feedback) -> Optional[gpd.GeoDataFrame]:
+        """Fallback rebuild of transit_trips_view when the base table is absent.
+
+        Recomputes only the columns recoverable from the view + editable source
+        layers: origin/destination (from terminals via o_id/d_id), route_long /
+        trip_short (from those), len_km (geometry), and vehicle_name /
+        passenger_capacity (agency_id -> agencies.vehicle_id -> vehicles). Every
+        overwrite is gap-safe: an unresolved key keeps the existing value rather
+        than blanking it. route_short is NOT touched (needs agency_serial).
+        """
+        df = self._load_existing_gdf(source.gpkg_path, "transit_trips_view")
+        if df.empty:
+            return None
+
+        def _str(s):
+            return s.astype(str).str.strip()
+
+        # origin / destination from terminals (gid -> name).
+        if "transit_terminals" in layers and {"o_id", "d_id"}.issubset(df.columns):
+            terminals = self._load_required_gdf(source, layers, "transit_terminals")
+            if "gid" in terminals.columns and "name" in terminals.columns:
+                tmap = dict(zip(_str(terminals["gid"]), terminals["name"]))
+                new_o = _str(df["o_id"]).map(tmap)
+                new_d = _str(df["d_id"]).map(tmap)
+                df["origin"] = new_o.where(new_o.notna(), df.get("origin"))
+                df["destination"] = new_d.where(new_d.notna(), df.get("destination"))
+
+        # vehicle_name / passenger_capacity via agency_id -> agencies.vehicle_id -> vehicles.
+        if "transit_agencies" in layers and "transit_vehicles" in layers and "agency_id" in df.columns:
+            agencies = self._load_required_df(source, layers, "transit_agencies")
+            vehicles = self._load_required_df(source, layers, "transit_vehicles")
+            if {"agency_id", "vehicle_id"}.issubset(agencies.columns) and "gid" in vehicles.columns:
+                veh_name = dict(zip(_str(vehicles["gid"]),
+                                    vehicles["name"] if "name" in vehicles.columns else vehicles["gid"]))
+                veh_cap = dict(zip(_str(vehicles["gid"]),
+                                   vehicles["passenger_capacity"])) if "passenger_capacity" in vehicles.columns else {}
+                ag_veh = dict(zip(_str(agencies["agency_id"]), _str(agencies["vehicle_id"])))
+                veh_id = _str(df["agency_id"]).map(ag_veh)
+                new_vn = veh_id.map(veh_name)
+                df["vehicle_name"] = new_vn.where(new_vn.notna(), df.get("vehicle_name"))
+                if veh_cap:
+                    new_pc = veh_id.map(veh_cap)
+                    df["passenger_capacity"] = new_pc.where(new_pc.notna(), df.get("passenger_capacity"))
+
+        # route_long / trip_short from the (possibly updated) origin/destination.
+        if {"origin", "destination"}.issubset(df.columns):
+            df["route_long"] = df.apply(
+                lambda r: f"{r['destination']} - {r['origin']}"
+                if str(r.get("origin", "")).lower() > str(r.get("destination", "")).lower()
+                else f"{r.get('origin', '')} - {r.get('destination', '')}",
+                axis=1,
+            )
+            df["trip_short"] = df.apply(
+                lambda r: f"{r.get('origin', '')}-{r.get('destination', '')}", axis=1
+            )
+
+        # len_km from geometry (skipped if the CRS transform is unavailable).
+        with contextlib.suppress(Exception):
+            df["len_km"] = df.to_crs(3857).geometry.length / 1000.0
+
+        return df
 
     def _build_trip_stops_sequence(self, source: SDISource, layers: set[str], stop_params: StopParams, feedback) -> pd.DataFrame:
         # Prefer transit_trips_view: it carries vehicle_name, passenger_capacity,
@@ -1087,10 +1415,9 @@ class RefreshSDIDerivedLayersAlgorithm(QgsProcessingAlgorithm):
             if pd.notna(ts):
                 return ts.time()
             for fmt in ("%H:%M", "%H:%M:%S"):
-                try:
+                # Try each accepted format; fall through to the next on mismatch.
+                with contextlib.suppress(Exception):
                     return pd.to_datetime(s, format=fmt, errors="raise").time()
-                except Exception:
-                    pass
             return None
 
         intervals["start_time"] = intervals["start_time"].apply(_to_time)

@@ -6,7 +6,7 @@
 name=TfC Tools
 qgisMinimumVersion=3.40
 description=A suite of tools by Transport for Cairo (TfC)
-version=2.3
+version=2.4
 author=Transport for Cairo
 email=info@transportforcairo.com
 
@@ -32,7 +32,15 @@ tracker=https://github.com/transportforcairo/tfc_tools/issues
 
 # Recommended items:
 hasProcessingProvider=yes
-changelog=Version 2.3:
+changelog=Version 2.4:
+    • New GTFS editing workflow: edit the SDI source layers in QGIS, then re-export GTFS — Refresh SDI is now the hub that validates edits and rebuilds derived layers
+    • Pre-flight GTFS attribute validation in Refresh SDI — checks stop/agency IDs, route_type, agency timezone, interval times, headways and cross-layer foreign keys; reports issues in the log, with an optional Strict validation mode that aborts on errors
+    • Safe key repairs in Refresh SDI (opt-in) — remaps agency_id stored as a gid to its text code and coerces integer keys stored as "1.0" back to INTEGER, fixing common foreign_key_violation causes
+    • Exported GeoPackages embed a default read-only QGIS edit form — locks the recomputed transit_trips_view columns and adds not-null/unique constraints on stop_id and agency_id
+    • Export SDI (PostGIS) now ships the transit_trips base table (matching the RouteLab export), so Refresh SDI can fully rebuild transit_trips_view after edits
+    • Refresh SDI recomputes trips_view terminal/vehicle/geometry-derived columns from the view when the base table is absent (legacy GeoPackages)
+    • Updated in-plugin help and User Guide for the editing workflow, validation and key-repair options
+    Version 2.3:
     • GIS2GTFS feed version bug fix — feed_name no longer silently used as feed_version
     • Interval attribution in Vehicle and Passenger Flow now ID-based (onboard_instances.interval_id → transit_intervals.observer_id), replacing timestamp bucketing
     • 6-tier hierarchical occupancy imputation with per-cell confidence fields (imputation_tier, imputation_method), replacing single-median fallback

@@ -12,6 +12,7 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
     import numpy as np
     from shapely import wkt, wkb, geometry
     import urllib.parse
+    import contextlib
 
     import os
     def sql_path(filename):
@@ -925,22 +926,16 @@ def run_migration(observer_db_params, sdi_db_params, observer_project_id, feedba
         ...
         feedback.pushInfo("Migration finished.")
     finally:
-        try:
+        # Best-effort cleanup: a failure to close/dispose must not mask the
+        # original exception (or the successful result) of the migration.
+        with contextlib.suppress(Exception):
             observer_db_con.close()
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             city_db_con.close()
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             observer_db_engine.dispose()
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             sdi_db_engine.dispose()
-        except Exception:
-            pass
 
     '''LARGE SECTION ABOVE WAS RELOCATED FROM THE BOTTOM TO UP HERE.
     THIS IS THE LAST SECTION IN script.ipynb'''

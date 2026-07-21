@@ -35,6 +35,7 @@ from qgis.core import (
 
 from ..tfc_tools_common.deps import ensure_deps
 from ..tfc_tools_common.sdi_io import postgres_engine_from_qgis_connection
+from ..tfc_tools_common.layer_styles import embed_default_forms
 from ..tfc_tools_common.stop_params import (
     StopParams,
     add_stop_params_to_algorithm,
@@ -144,6 +145,9 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
 
     <b>Outputs</b>
     • GeoPackage containing standardized tables (raw and transit equivalents)<br>
+    • A default QGIS edit form embedded in the GeoPackage: the recomputed
+    transit_trips_view columns are read-only, and stop_id / agency_id carry
+    not-null / unique constraints (supports the edit-in-QGIS, re-export-GTFS workflow).<br>
 
     <b>Use Cases</b>
     • Offline analysis without PostgreSQL
@@ -234,13 +238,13 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         p = QgsProcessingParameterNumber(
             self.FALLBACK_HEADWAY,
             self.tr("Headway (seconds) for empty values (optional)"),
-            type=QgsProcessingParameterNumber.Integer,
+            type=QgsProcessingParameterNumber.Type.Integer,
             defaultValue=None,
             optional=True,
         )
         # Older QGIS versions may not expose FlagAdvanced on this parameter type.
         with contextlib.suppress(Exception):
-            p.setFlags(p.flags() | QgsProcessingParameterNumber.FlagAdvanced)
+            p.setFlags(p.flags() | QgsProcessingParameterNumber.Flag.FlagAdvanced)
         self.addParameter(p)
 
         # Stop-extraction parameters (all advanced, all with sensible defaults).
@@ -462,6 +466,7 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
                 ROW_NUMBER() OVER () AS gid,
                 NULLIF(TRIM(tp.name), '') AS raw_name,
                 tp.onboard_instance_id::text AS onboard_instance_observer_id,
+                oi.trip_id::text AS onboard_trip_id,   -- links to transit_trips.observer_id → direction_id
                 tp.created_at AS created_at,
                 tp.alight As alight,
                 tp.board AS board,
@@ -483,50 +488,46 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         # dbscan_eps_m / dbscan_minpoints bound at execute time via params dict.
         return f"""
         WITH
+        {ExportRouteLabToGeoPackageAlgorithm._cte_trips()},
         {ExportRouteLabToGeoPackageAlgorithm._cte_raw_stops()},
-        pts AS (
+        attributed AS (
+            -- Attribute each raw stop to its surveyed direction via the onboard
+            -- instance's trip → transit_trips.observer_id → direction_id.
             SELECT
                 s.gid AS src_id,
-                s.raw_name,
-                s.geom,
+                NULLIF(regexp_replace(BTRIM(s.raw_name), '\\s+', ' ', 'g'), '') AS raw_name,
+                tt.direction_id AS direction_id,
                 ST_Transform(s.geom, 3857) AS g3857
             FROM raw_stops s
-            WHERE s.geom IS NOT NULL
+            JOIN transit_trips tt ON s.onboard_trip_id = tt.observer_id
+            WHERE s.geom IS NOT NULL AND tt.direction_id IS NOT NULL
         ),
-        clusters AS (
-            SELECT *, ST_ClusterDBSCAN(g3857, eps := %(dbscan_eps_m)s, minpoints := %(dbscan_minpoints)s) OVER () AS cluster_id
-            FROM pts
+        clustered AS (
+            SELECT *,
+                   ST_ClusterDBSCAN(g3857, eps := %(dbscan_eps_m)s, minpoints := %(dbscan_minpoints)s)
+                     OVER (PARTITION BY direction_id) AS cluster_id
+            FROM attributed
         ),
-        valid AS (
-            SELECT * FROM clusters WHERE cluster_id IS NOT NULL
-        ),
-        agg AS (
-            SELECT
-                cluster_id,
-                COUNT(*) AS n_points,
-                ST_Transform(ST_Centroid(ST_Collect(g3857)), 4326) AS centroid
-            FROM valid
-            GROUP BY cluster_id
-        ),
+        valid AS (SELECT * FROM clustered WHERE cluster_id IS NOT NULL),
         name_counts AS (
-            SELECT v.cluster_id, v.raw_name, COUNT(*) AS cnt
-            FROM valid v
-            WHERE v.raw_name IS NOT NULL
-            GROUP BY v.cluster_id, v.raw_name
+            SELECT direction_id, cluster_id, raw_name, COUNT(*) AS cnt
+            FROM valid WHERE raw_name IS NOT NULL
+            GROUP BY direction_id, cluster_id, raw_name
         ),
         name_mode AS (
-            SELECT cluster_id,
+            SELECT direction_id, cluster_id,
                    (ARRAY_AGG(raw_name ORDER BY cnt DESC NULLS LAST, raw_name))[1] AS mode_name
-            FROM name_counts
-            GROUP BY cluster_id
+            FROM name_counts GROUP BY direction_id, cluster_id
         )
         SELECT
-            a.cluster_id,
-            a.n_points,
-            a.centroid,
-            COALESCE(n.mode_name, 'Unnamed') AS mode_name
-        FROM agg a
-        LEFT JOIN name_mode n USING (cluster_id)
+            v.direction_id,
+            v.cluster_id,
+            COUNT(*) AS n_points,
+            ST_Transform(ST_Centroid(ST_Collect(v.g3857)), 4326) AS centroid,
+            COALESCE(nm.mode_name, 'Unnamed') AS mode_name
+        FROM valid v
+        LEFT JOIN name_mode nm USING (direction_id, cluster_id)
+        GROUP BY v.direction_id, v.cluster_id, nm.mode_name
         """  # nosec B608 — only composes sibling builders; no user values in f-string
 
     @staticmethod
@@ -536,119 +537,146 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         return f"""
         WITH
         {ExportRouteLabToGeoPackageAlgorithm._cte_trips()},
-        stop_clusters AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stop_clusters()}),
-        const AS (
-            SELECT 250::double precision AS MIN_SPACING_M,
-                   %(snap_max_m)s::double precision  AS SNAP_MAX_M,
-                   %(terminal_m)s::double precision  AS TERMINAL_M
+        {ExportRouteLabToGeoPackageAlgorithm._cte_raw_stops()},
+        -- Attribute + cluster PER direction (see create_processed_stops.sql).
+        attributed AS (
+            SELECT
+                s.gid AS src_id,
+                NULLIF(regexp_replace(BTRIM(s.raw_name), '\\s+', ' ', 'g'), '') AS raw_name,
+                tt.direction_id AS direction_id,
+                ST_Transform(s.geom, 3857) AS g3857
+            FROM raw_stops s
+            JOIN transit_trips tt ON s.onboard_trip_id = tt.observer_id
+            WHERE s.geom IS NOT NULL AND tt.direction_id IS NOT NULL
         ),
-        c AS (
-            SELECT sc.cluster_id, sc.mode_name, sc.n_points, sc.centroid,
-                   ST_Transform(sc.centroid, 3857) AS c3857
-            FROM stop_clusters sc
+        clustered AS (
+            SELECT a.*,
+                   ST_ClusterDBSCAN(g3857, eps := %(dbscan_eps_m)s, minpoints := %(dbscan_minpoints)s)
+                     OVER (PARTITION BY direction_id) AS cid
+            FROM attributed a
         ),
-        spaced AS (
-            WITH params AS (SELECT %(cell_m)s::double precision AS cell_m),
-            cells AS (
-                SELECT
-                    c.*,
-                    (SELECT cell_m FROM params) AS cell_m,
-                    FLOOR(ST_X(c.c3857) / (SELECT cell_m FROM params)) AS gx,
-                    FLOOR(ST_Y(c.c3857) / (SELECT cell_m FROM params)) AS gy
-                FROM c
-            ),
-            ranked AS (
-                SELECT
-                    cells.*,
-                    ROW_NUMBER() OVER (PARTITION BY gx, gy ORDER BY n_points DESC, cluster_id) AS rnk
-                FROM cells
-            )
-            SELECT cluster_id, mode_name, n_points, centroid AS geom, c3857
-            FROM ranked
-            WHERE rnk = 1
+        -- Tier A: confident clusters (cid not null)
+        tierA_names AS (
+            SELECT direction_id, cid,
+                   (ARRAY_AGG(raw_name ORDER BY cnt DESC, raw_name))[1] AS mode_name
+            FROM (
+                SELECT direction_id, cid, raw_name, COUNT(*) AS cnt
+                FROM clustered WHERE cid IS NOT NULL AND raw_name IS NOT NULL
+                GROUP BY direction_id, cid, raw_name
+            ) z
+            GROUP BY direction_id, cid
         ),
-        nearest AS (
-            SELECT s.cluster_id,
-                   s.mode_name,
-                   s.geom AS orig_geom,
-                   t.gid AS trip_gid,
-                   ST_Transform(
-                     ST_ClosestPoint(ST_Transform(t.geom,3857), s.c3857), 4326
-                   ) AS geom,
-                   ST_Distance(s.c3857, ST_Transform(t.geom,3857)) AS dist_m,
-                   t.geom AS trip_geom
-            FROM spaced s
+        tierA AS (
+            SELECT cl.direction_id, cl.cid,
+                   COUNT(*) AS n_points,
+                   ST_Centroid(ST_Collect(cl.g3857)) AS c3857,
+                   COALESCE(nm.mode_name, 'Unnamed') AS mode_name
+            FROM clustered cl
+            LEFT JOIN tierA_names nm USING (direction_id, cid)
+            WHERE cl.cid IS NOT NULL
+            GROUP BY cl.direction_id, cl.cid, nm.mode_name
+        ),
+        tierA_snap AS (
+            SELECT a.direction_id, a.n_points, a.mode_name,
+                   ST_ClosestPoint(ST_Transform(tl.geom, 3857), a.c3857) AS g3857,
+                   ST_Distance(a.c3857, ST_Transform(tl.geom, 3857))     AS dist_m,
+                   tl.geom AS trip_geom
+            FROM tierA a
             JOIN LATERAL (
-                SELECT gid, geom
-                FROM transit_trips
-                WHERE geom IS NOT NULL
-                ORDER BY s.c3857 <-> ST_Transform(geom,3857)
-                LIMIT 1
-            ) t ON TRUE
+                SELECT geom FROM transit_trips
+                WHERE geom IS NOT NULL AND direction_id = a.direction_id
+                ORDER BY a.c3857 <-> ST_Transform(geom, 3857) LIMIT 1
+            ) tl ON TRUE
         ),
-        kept AS (
-            SELECT * FROM nearest WHERE dist_m <= (SELECT SNAP_MAX_M FROM const)
-        ),
-        term AS (
-            SELECT k.*,
-                   CASE WHEN ST_DWithin(
-                              ST_Transform(k.geom,3857),
-                              ST_StartPoint(ST_Transform(k.trip_geom,3857)),
-                              (SELECT TERMINAL_M FROM const)
-                          )
-                          OR ST_DWithin(
-                              ST_Transform(k.geom,3857),
-                              ST_EndPoint(ST_Transform(k.trip_geom,3857)),
-                              (SELECT TERMINAL_M FROM const)
-                          )
+        tierA_typed AS (
+            SELECT direction_id, n_points, mode_name, g3857,
+                   CASE WHEN ST_DWithin(g3857, ST_StartPoint(ST_Transform(trip_geom,3857)), %(terminal_m)s)
+                          OR ST_DWithin(g3857, ST_EndPoint(ST_Transform(trip_geom,3857)),   %(terminal_m)s)
                         THEN 'Terminal' ELSE 'Informal' END AS stop_type
-            FROM kept k
+            FROM tierA_snap
+            WHERE dist_m <= %(snap_max_m)s
         ),
-        bearing_calc AS (
-            SELECT
-                cluster_id, mode_name, stop_type, geom, trip_geom,
-                degrees(
-                    ST_Azimuth(
-                        ST_LineInterpolatePoint(
-                            ST_Transform(trip_geom,3857),
-                            GREATEST(
-                                ST_LineLocatePoint(ST_Transform(trip_geom,3857), ST_Transform(geom,3857)) - 0.0005,
-                                0
-                            )
-                        ),
-                        ST_LineInterpolatePoint(
-                            ST_Transform(trip_geom,3857),
-                            LEAST(
-                                ST_LineLocatePoint(ST_Transform(trip_geom,3857), ST_Transform(geom,3857)) + 0.0005,
-                                1
-                            )
-                        )
-                    )
-                ) AS bearing
-            FROM term
+        -- Tier B: coverage rescue of isolated on-route noise points.
+        noise_snap AS (
+            SELECT n.direction_id,
+                   COALESCE(NULLIF(n.raw_name, ''), 'Unnamed') AS mode_name,
+                   ST_ClosestPoint(ST_Transform(tl.geom, 3857), n.g3857) AS g3857,
+                   ST_Distance(n.g3857, ST_Transform(tl.geom, 3857))     AS dist_m
+            FROM (SELECT direction_id, raw_name, g3857 FROM clustered WHERE cid IS NULL) n
+            JOIN LATERAL (
+                SELECT geom FROM transit_trips
+                WHERE geom IS NOT NULL AND direction_id = n.direction_id
+                ORDER BY n.g3857 <-> ST_Transform(geom, 3857) LIMIT 1
+            ) tl ON TRUE
         ),
-        final AS (
+        noise_clustered AS (
+            SELECT nk.*,
+                   ST_ClusterDBSCAN(g3857, eps := %(rescue_gap_m)s, minpoints := 1)
+                     OVER (PARTITION BY direction_id) AS ncid
+            FROM noise_snap nk
+            WHERE dist_m <= %(snap_max_m)s
+        ),
+        noise_rep AS (
+            SELECT direction_id,
+                   COUNT(*) AS n_points,
+                   ST_Centroid(ST_Collect(g3857)) AS g3857,
+                   (ARRAY_AGG(mode_name ORDER BY (mode_name = 'Unnamed'), mode_name))[1] AS mode_name
+            FROM noise_clustered
+            GROUP BY direction_id, ncid
+        ),
+        rescued AS (
+            SELECT r.direction_id, r.n_points, r.mode_name, r.g3857,
+                   'Informal'::text AS stop_type
+            FROM noise_rep r
+            WHERE NOT EXISTS (
+                SELECT 1 FROM tierA_typed a
+                WHERE a.direction_id = r.direction_id
+                  AND ST_DWithin(a.g3857, r.g3857, %(rescue_gap_m)s)
+            )
+        ),
+        auto AS (
             SELECT
-                cluster_id,
-                mode_name,
-                stop_type,
-                geom,
-                CASE WHEN (bearing + 360)::int %% 360 BETWEEN 45 AND 225 THEN 1 ELSE 0 END AS dir_bin
-            FROM bearing_calc
+                ROW_NUMBER() OVER (ORDER BY direction_id, ST_X(g3857), ST_Y(g3857)) AS auto_id,
+                direction_id, n_points, mode_name, stop_type,
+                ST_Transform(g3857, 4326) AS geom, g3857
+            FROM (
+                SELECT direction_id, n_points, mode_name, stop_type, g3857 FROM tierA_typed
+                UNION ALL
+                SELECT direction_id, n_points, mode_name, stop_type, g3857 FROM rescued
+            ) u
+        ),
+        -- Pairing: match dir-0 to nearest dir-1 within pair_max (used-once).
+        d0 AS (SELECT * FROM auto WHERE direction_id = 0),
+        d1 AS (SELECT * FROM auto WHERE direction_id = 1),
+        cand AS (
+            SELECT d0.auto_id AS a0, m.auto_id AS a1, ST_Distance(d0.g3857, m.g3857) AS d
+            FROM d0
+            JOIN LATERAL (
+                SELECT auto_id, g3857 FROM d1
+                WHERE ST_DWithin(d1.g3857, d0.g3857, %(pair_max_m)s)
+                ORDER BY d1.g3857 <-> d0.g3857 LIMIT 1
+            ) m ON TRUE
+        ),
+        pairs AS (
+            SELECT DISTINCT ON (a1) a0, a1, d FROM cand ORDER BY a1, d
+        ),
+        grouped AS (
+            SELECT a.*,
+                   CASE WHEN p.a0  IS NOT NULL THEN 'g' || p.a0::text  END AS grp_from_d0,
+                   CASE WHEN p2.a0 IS NOT NULL THEN 'g' || p2.a0::text END AS grp_from_d1
+            FROM auto a
+            LEFT JOIN pairs p  ON a.auto_id = p.a0
+            LEFT JOIN pairs p2 ON a.auto_id = p2.a1
         )
         SELECT
-            mode_name AS stop_name,
-            CASE stop_type WHEN 'Terminal' THEN 2 ELSE 0 END AS location_type,
-            mode_name || CASE WHEN dir_bin = 0 THEN ' (Dir 0)' ELSE ' (Dir 1)' END AS stop_desc,
+            mode_name                          AS stop_name,
+            direction_id,
+            0                                  AS location_type,
             stop_type,
-            cluster_id,
-            dir_bin AS "double",
-            -- stop_lon / stop_lat intentionally omitted: the point geometry is
-            -- the single source of truth. Derive coordinates from geom at read
-            -- time; storing scalar coordinates risks them desyncing from the
-            -- geometry when stops are edited visually in QGIS.
+            n_points,
+            COALESCE(grp_from_d0, grp_from_d1) AS stop_group,
             geom
-        FROM final
+        FROM grouped
         """  # nosec B608 — only composes sibling builders; no user values in f-string
 
     @staticmethod
@@ -656,12 +684,14 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
         return f"""
         WITH stops_auto AS ({ExportRouteLabToGeoPackageAlgorithm._sql_stops_auto()})
         SELECT
-            ROW_NUMBER() OVER (ORDER BY stop_name, cluster_id, "double") AS gid,
-            (ROW_NUMBER() OVER (ORDER BY stop_name, cluster_id, "double"))::text AS stop_id,
+            ROW_NUMBER() OVER (ORDER BY direction_id, stop_name) AS gid,
+            (ROW_NUMBER() OVER (ORDER BY direction_id, stop_name))::text AS stop_id,
             stop_name,
-            stop_desc,
+            stop_name AS stop_desc,     -- clean name; direction lives in direction_id
+            direction_id,
             location_type,
-            "double",
+            stop_type,
+            stop_group,
             -- stop_lon / stop_lat intentionally omitted (see _sql_stops_auto).
             geom
         FROM stops_auto
@@ -1149,6 +1179,8 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             "dbscan_minpoints":    stop_params.dbscan_minpoints,
             "snap_max_m":          stop_params.snap_max_m,
             "terminal_m":          stop_params.terminal_m,
+            "pair_max_m":          stop_params.pair_max_m,
+            "rescue_gap_m":        stop_params.rescue_gap_m,
             "cell_m":              stop_params.cell_m,
             "stop_trip_buffer_m":  stop_params.stop_trip_buffer_m,
             "min_stop_spacing_m":  stop_params.min_stop_spacing_m,
@@ -1377,5 +1409,6 @@ class ExportRouteLabToGeoPackageAlgorithm(QgsProcessingAlgorithm):
             if raw_frequency is not None:
                 _write_gdf(out_gpkg, "raw_frequency_instances", raw_frequency)
 
+        embed_default_forms(out_gpkg, feedback)
         feedback.pushInfo(f"GeoPackage written: {out_gpkg}")
         return {"OUT_GPKG": out_gpkg}

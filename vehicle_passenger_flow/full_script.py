@@ -71,13 +71,13 @@ def _qvariant_type_for_series(s: pd.Series):
 def _wkb_from_geom_type(geom_type_str: str):
     # Map common GeoPandas geom types to QGIS WKB
     g = geom_type_str.lower()
-    if "multilinestring" in g: return QgsWkbTypes.MultiLineString
-    if "linestring"      in g: return QgsWkbTypes.LineString
-    if "multipolygon"    in g: return QgsWkbTypes.MultiPolygon
-    if "polygon"         in g: return QgsWkbTypes.Polygon
-    if "multipoint"      in g: return QgsWkbTypes.MultiPoint
-    if "point"           in g: return QgsWkbTypes.Point
-    return QgsWkbTypes.Unknown
+    if "multilinestring" in g: return QgsWkbTypes.Type.MultiLineString
+    if "linestring"      in g: return QgsWkbTypes.Type.LineString
+    if "multipolygon"    in g: return QgsWkbTypes.Type.MultiPolygon
+    if "polygon"         in g: return QgsWkbTypes.Type.Polygon
+    if "multipoint"      in g: return QgsWkbTypes.Type.MultiPoint
+    if "point"           in g: return QgsWkbTypes.Type.Point
+    return QgsWkbTypes.Type.Unknown
 
 
 from qgis.core import QgsCoordinateReferenceSystem
@@ -195,10 +195,10 @@ def save_gdf_with_qgis_writer(gdf, out_path, layer_name, feedback=None):
     if out_path.lower().endswith(".gpkg"):
         if os.path.exists(out_path):
             # overwrite/replace this layer inside the existing gpkg
-            options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+            options.actionOnExistingFile = QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteLayer
         else:
             # create a new gpkg file
-            options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+            options.actionOnExistingFile = QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteFile
 
     # try write
     transform_ctx = QgsProject.instance().transformContext() or QgsCoordinateTransformContext()
@@ -206,16 +206,16 @@ def save_gdf_with_qgis_writer(gdf, out_path, layer_name, feedback=None):
 
     err, new_file, new_layer = _interpret_writer_result(res)
 
-    if err != QgsVectorFileWriter.NoError:
+    if err != QgsVectorFileWriter.WriterError.NoError:
         # retry logic for GPKG only
         if out_path.lower().endswith(".gpkg") and os.path.exists(out_path):
             try:
                 if feedback: feedback.pushInfo(f"[WARN] Writer error {err}. Retrying after removing {out_path}…")
                 os.remove(out_path)
-                options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+                options.actionOnExistingFile = QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteFile
                 res2 = QgsVectorFileWriter.writeAsVectorFormatV3(vl, out_path, transform_ctx, options)
                 err2, _, _ = _interpret_writer_result(res2)
-                if err2 != QgsVectorFileWriter.NoError:
+                if err2 != QgsVectorFileWriter.WriterError.NoError:
                     raise RuntimeError(f"Failed writing '{layer_name}' to {out_path}. Writer code: {res2}")
                 if feedback: feedback.pushInfo(f"[OK] Wrote layer '{layer_name}' to {out_path} (fresh file).")
                 return
